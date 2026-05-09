@@ -29,6 +29,7 @@ DEFAULT_SPEAKERS = [
     "Jerome Powell",
     "Marco Rubio",
     "Michael Barr",
+    "Pete Hegseth",
     # Friend's additional speakers (Fed governors + Treasury)
     "Scott Bessent",
     "Michelle Bowman",
