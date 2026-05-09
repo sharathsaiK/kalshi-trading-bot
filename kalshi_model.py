@@ -407,7 +407,33 @@ def _mask_settlement_odds(ko) -> float:
 # Training data — source 1: training_data table
 # ---------------------------------------------------------------------------
 
-def _rows_from_training_table(priors: dict) -> list[dict]:
+def _compute_word_ranks() -> dict:
+    """
+    For each (speaker, word) pair, compute the rank of that word by avg_freq
+    among all words the speaker has data for. Rank 1 = most frequently mentioned.
+    Returns dict: {(speaker, word): rank}
+    """
+    with db._connect() as conn:
+        rows = conn.execute(
+            "SELECT speaker, word, avg_freq FROM training_data "
+            "WHERE event_date IS NULL OR event_date < ?",
+            (HOLDOUT_CUTOFF,),
+        ).fetchall()
+
+    from collections import defaultdict
+    speaker_words: dict = defaultdict(list)
+    for speaker, word, freq in rows:
+        speaker_words[speaker].append((word, float(freq or 0.0)))
+
+    ranks: dict = {}
+    for speaker, wf_list in speaker_words.items():
+        sorted_words = sorted(set(wf_list), key=lambda x: -x[1])
+        for rank, (word, _) in enumerate(sorted_words, start=1):
+            ranks[(speaker, word)] = rank
+    return ranks
+
+
+def _rows_from_training_table(priors: dict, word_ranks: dict | None = None) -> list[dict]:
     rows = db.get_training_data()
     out  = []
     for r in rows:
@@ -520,8 +546,9 @@ def build_training_dataset(verbose: bool = True) -> pd.DataFrame:
     event_date, _weight) for use in leak-free CV fold construction.
     """
     priors = _compute_word_priors()
+    word_ranks = _compute_word_ranks()
 
-    real_rows  = _rows_from_training_table(priors) + _rows_from_trade_log(priors)
+    real_rows  = _rows_from_training_table(priors, word_ranks) + _rows_from_trade_log(priors)
     n_real     = len(real_rows)
 
     if not real_rows:
