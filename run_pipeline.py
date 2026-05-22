@@ -36,7 +36,7 @@ from kalshi_word_counter import KalshiCounter, extract_speaker_turns
 # ---------------------------------------------------------------------------
 
 _DEFAULT_MIN_EDGE     = 0.10   # minimum |EV| to log a trade recommendation
-_DEFAULT_YES_MIN_EDGE = 0.18   # higher bar for YES bets (model over-predicts YES)
+_DEFAULT_YES_MIN_EDGE = 0.22   # higher bar for YES bets — model over-predicts YES in 0.5-0.7 range
 _DEFAULT_NO_MIN_EDGE  = 0.10   # lower bar for NO bets (more reliable)
 _MIN_TRANSCRIPT_CHARS = 5_000
 

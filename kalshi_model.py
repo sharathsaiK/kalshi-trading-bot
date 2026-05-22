@@ -78,7 +78,7 @@ FEATURES = [
     "topic_match",                   # transformer relevancy to event topic (NaN if not fetched)
     "rel_max",                       # news: max relevancy score (NaN if not fetched)
     "rel_mean",                      # news: mean relevancy score
-    "rel_top3_mean",                 # news: mean of top-3 relevancy scores
+    "rel_top3_mean",                 # news: mean of top-3 relevancy scores (94% NaN → learned NaN direction helps calibration)
     "rel_count_hi",                  # news: count of high-relevancy articles
     "rel_n",                         # news: total articles fetched for this word
 ]
@@ -1030,7 +1030,7 @@ def train(save: bool = True, verbose: bool = True) -> lgb.Booster:
         if verbose:
             print(f"\n  OOF Brier (raw)  : {oof_brier_raw:.4f}")
             print(f"  OOF Brier (cal)  : {oof_brier_cal:.4f}")
-        _MIN_CAL_IMPROVEMENT = 100.0   # isotonic overfits OOF — disable for now
+        _MIN_CAL_IMPROVEMENT = 0.005   # require meaningful OOF improvement (Platt ~0.001 typical, rarely triggers)
         if oof_brier_raw - oof_brier_cal >= _MIN_CAL_IMPROVEMENT:
             calibrator = _cand
             if verbose:
@@ -1145,24 +1145,45 @@ def train(save: bool = True, verbose: bool = True) -> lgb.Booster:
 
 
 # ---------------------------------------------------------------------------
-# Calibration — isotonic regression on production-distribution OOF predictions
+# Calibration — Platt scaling (2-param sigmoid) on OOF predictions
 # ---------------------------------------------------------------------------
 
 def _fit_calibrator(oof_preds: np.ndarray, y_true: np.ndarray):
     """
-    Fit isotonic regression calibrator on production-distribution OOF predictions.
+    Fit Platt scaling: p_cal = sigmoid(a * logit(p) + b).
+    2 parameters — can't overfit OOF the way isotonic regression does.
+    a<1 compresses predictions toward 0.5 (fixes over-confidence).
+    b<0 shifts predictions downward (fixes systematic over-prediction).
     Returns None if fewer than 30 samples.
     """
+    from scipy.optimize import minimize
     if len(oof_preds) < 30:
         return None
-    ir = IsotonicRegression(y_min=0.01, y_max=0.99, out_of_bounds="clip")
-    ir.fit(oof_preds, y_true)
-    return ("isotonic", ir)
+    p = np.clip(oof_preds, 1e-7, 1 - 1e-7)
+    logits = np.log(p) - np.log(1 - p)
+    y = np.asarray(y_true, dtype=float)
+
+    def nll(params):
+        a, b = params
+        s = a * logits + b
+        log_p   = np.where(s >= 0, -np.log1p(np.exp(-s)), s - np.log1p(np.exp(s)))
+        log_1mp = np.where(s >= 0, -s - np.log1p(np.exp(-s)), -np.log1p(np.exp(s)))
+        return -np.mean(y * log_p + (1 - y) * log_1mp)
+
+    res = minimize(nll, x0=[1.0, 0.0], method="Nelder-Mead",
+                   options={"xatol": 1e-5, "fatol": 1e-6, "maxiter": 2000})
+    a, b = float(res.x[0]), float(res.x[1])
+    return ("platt", (a, b))
 
 
 def _apply_calibrator(calibrator, probs: np.ndarray) -> np.ndarray:
-    _, model = calibrator
-    return model.predict(probs)
+    kind, model = calibrator
+    if kind == "platt":
+        a, b = model
+        p = np.clip(probs, 1e-7, 1 - 1e-7)
+        logits = np.log(p) - np.log(1 - p)
+        return 1.0 / (1.0 + np.exp(-(a * logits + b)))
+    return model.predict(probs)  # isotonic fallback
 
 
 # Both blending and capping were found to HURT holdout calibration:

@@ -25,7 +25,7 @@ import kalshi_model
 
 
 NO_MIN_EDGE  = 0.10   # matches run_pipeline._DEFAULT_NO_MIN_EDGE
-YES_MIN_EDGE = 0.18   # matches run_pipeline._DEFAULT_YES_MIN_EDGE (model over-predicts YES)
+YES_MIN_EDGE = 0.22   # higher bar for YES bets — model over-predicts YES in 0.5-0.7 range
 MIN_WARM     = 0          # allow cold rows for NO bets; YES still requires n>=3 (enforced inside _simulate)
 HOLDOUT_CUTOFF = kalshi_model.HOLDOUT_CUTOFF
 
