@@ -7,3 +7,9 @@ venv/
 .DS_Store
 *.txt
 youtube_key.py
+.env
+lightgbm_repo/
+pa6.c
+shelter
+find_leads.py
+adopt.txt
