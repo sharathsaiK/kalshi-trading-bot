@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import sys
+from typing import Optional
 import numpy as np
 import pandas as pd
 from sklearn.metrics import brier_score_loss, roc_auc_score, accuracy_score
@@ -23,8 +24,9 @@ import db
 import kalshi_model
 
 
-MIN_EDGE     = 0.10
-MIN_WARM     = 3          # n_samples_lifetime gate for betting
+NO_MIN_EDGE  = 0.10   # matches run_pipeline._DEFAULT_NO_MIN_EDGE
+YES_MIN_EDGE = 0.18   # matches run_pipeline._DEFAULT_YES_MIN_EDGE (model over-predicts YES)
+MIN_WARM     = 0          # allow cold rows for NO bets; YES still requires n>=3 (enforced inside _simulate)
 HOLDOUT_CUTOFF = kalshi_model.HOLDOUT_CUTOFF
 
 
@@ -48,8 +50,9 @@ def _calibration_error(y_true: np.ndarray, probs: np.ndarray,
 
 
 def _simulate(y: np.ndarray, probs: np.ndarray,
-              ko: np.ndarray, warm: np.ndarray) -> dict:
-    """Flat $1/bet P&L simulation — warm-gated, min_edge=0.10."""
+              ko: np.ndarray, warm: np.ndarray,
+              nsamp: Optional[np.ndarray] = None) -> dict:
+    """Flat $1/bet P&L simulation — warm-gated, separate YES/NO thresholds."""
     max_no = kalshi_model._MAX_NO_BET_ODDS
 
     total = yes_pnl = no_pnl = warm_pnl = cold_pnl = 0.0
@@ -68,15 +71,18 @@ def _simulate(y: np.ndarray, probs: np.ndarray,
         p    = float(probs[i])
         odds = float(ko[i])
         yi   = int(y[i])
+        n_s  = int(nsamp[i]) if nsamp is not None else 99
 
         ev_yes = p - odds
         ev_no  = (1.0 - p) - (1.0 - odds)
 
-        if ev_yes >= MIN_EDGE and ev_yes >= ev_no:
+        # YES bets require ≥3 events of history — n_samples=2 predictions are
+        # dominated by hit_rate_lifetime which is too noisy for YES confidence
+        if ev_yes >= YES_MIN_EDGE and ev_yes >= ev_no and n_s >= 3:
             side, entry = "YES", odds
             won = (yi == 1)
             evs.append(ev_yes)
-        elif ev_no >= MIN_EDGE and odds <= max_no:
+        elif ev_no >= NO_MIN_EDGE and odds <= max_no:
             side, entry = "NO", (1.0 - odds)
             won = (yi == 0)
             evs.append(ev_no)
@@ -187,6 +193,7 @@ def run(retrain: bool = True) -> None:
     df = pd.DataFrame(holdout_rows)
     df["_word"]       = df["word"]
     df["_event_type"] = df["event_type"]
+    df["_speaker"]    = df["speaker"]
 
     print(f"\nHoldout loaded: {len(df)} rows, "
           f"{df['event_ticker'].nunique()} events, "
@@ -199,13 +206,26 @@ def run(retrain: bool = True) -> None:
 
     X        = kalshi_model._build_features_with_priors(df, priors)
     raw_prob = np.mean([b.predict(X) for b in ens], axis=0)
+
+    # Blend in LR ensemble member — must match predict_proba() behavior in run_pipeline.
+    lr_bundle = kalshi_model._load_lr_model()
+    if lr_bundle is not None:
+        X_lr = X.copy()
+        for col, med in lr_bundle["col_medians"].items():
+            if col in X_lr.columns:
+                X_lr[col] = X_lr[col].fillna(med)
+        X_lr_s  = lr_bundle["scaler"].transform(X_lr.values)
+        lr_prob = lr_bundle["model"].predict_proba(X_lr_s)[:, 1]
+        raw_prob = (raw_prob * 10 + lr_prob) / 11
+
     probs    = (kalshi_model._apply_calibrator(cal, raw_prob)
                 if cal is not None else raw_prob)
     probs    = kalshi_model._post_process_probs(probs, df["kalshi_odds"].values.astype(float))
 
-    y    = df["did_say_word"].astype(int).values
-    ko   = df["kalshi_odds"].values.astype(float)
-    warm = (df["n_samples_lifetime"] >= MIN_WARM).values
+    y     = df["did_say_word"].astype(int).values
+    ko    = df["kalshi_odds"].values.astype(float)
+    warm  = (df["n_samples_lifetime"] >= MIN_WARM).values
+    nsamp = df["n_samples_lifetime"].values.astype(int)
 
     # ── 4. Metrics ───────────────────────────────────────────────────────────
     brier          = brier_score_loss(y, probs)
@@ -221,7 +241,7 @@ def run(retrain: bool = True) -> None:
     bettable     = int(((ko > 0.04) & (ko < 0.96)).sum())
     warm_bettable = int(((ko > 0.04) & (ko < 0.96) & warm).sum())
 
-    sim = _simulate(y, probs, ko, warm)
+    sim = _simulate(y, probs, ko, warm, nsamp=nsamp)
 
     # ── 5. Calibration buckets ───────────────────────────────────────────────
     print("\nCALIBRATION BUCKETS (holdout)")
@@ -246,7 +266,7 @@ def run(retrain: bool = True) -> None:
         if mask.sum() == 0:
             continue
         sp_brier = brier_score_loss(y[mask], probs[mask])
-        sp_sim   = _simulate(y[mask], probs[mask], ko[mask], warm[mask])
+        sp_sim   = _simulate(y[mask], probs[mask], ko[mask], warm[mask], nsamp=nsamp[mask])
         print(f"  {sp:<20} {mask.sum():>5}  {sp_brier:.4f}  {sp_sim['n_bets']:>5}  "
               f"{sp_sim['pnl']:>+6}¢")
 

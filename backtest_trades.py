@@ -92,6 +92,7 @@ def backtest_event(
     bankroll: float = _DEFAULT_BANKROLL,
     kelly_fraction: float = _DEFAULT_KELLY_FRACTION,
     min_edge: float = 0.10,
+    yes_min_edge: float = 0.18,
 ) -> None:
     """
     Run a full hypothetical backtest on a single Kalshi event.
@@ -163,7 +164,7 @@ def backtest_event(
         ev_yes = our_prob - yes_ask
         ev_no  = (1.0 - our_prob) - no_ask
 
-        if ev_yes >= min_edge and ev_yes >= ev_no:
+        if ev_yes >= yes_min_edge and ev_yes >= ev_no:
             side, ask_price, side_prob = "YES", yes_ask, our_prob
         elif ev_no >= min_edge:
             if yes_ask > kalshi_model._MAX_NO_BET_ODDS:

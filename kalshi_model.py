@@ -35,16 +35,26 @@ import topic_match
 MODEL_PATH       = Path(__file__).parent / "kalshi_model.lgb"
 CALIBRATOR_PATH  = Path(__file__).parent / "kalshi_calibrator.pkl"
 WORD_PRIORS_PATH = Path(__file__).parent / "kalshi_word_priors.pkl"
+LR_MODEL_PATH    = Path(__file__).parent / "kalshi_lr_model.pkl"
 
 # Holdout cutoff — events on or after this date NEVER enter training.
 HOLDOUT_CUTOFF = "2026-03-01"
 
 # Bayesian shrinkage for word priors: alpha = n / (n + K).
-# K=15 → avg 2.9 obs/word → 16% trust in word rate, 84% toward global prior.
-_WORD_PRIOR_K = 15.0
+_WORD_PRIOR_K_DEFAULT = 15.0
 
 # Minimum real rows before we trust the model over the simple hit_rate fallback.
 _MIN_REAL_ROWS = 50
+
+
+def _speaker_k(n_obs: int) -> float:
+    """Tiered K for hit_rate_credibility shrinkage (LF-058).
+    Low-obs speakers get K=5 so their small sample is trusted faster."""
+    if n_obs > 500:
+        return 25.0
+    if n_obs >= 50:
+        return 15.0
+    return 5.0
 
 # Features used for training and inference.
 FEATURES = [
@@ -54,16 +64,23 @@ FEATURES = [
     "avg_freq",
     "recency",
     "n_samples_lifetime",
-    "kalshi_odds",                  # NaN for settlement rows (≤0.04 or ≥0.96)
-    "topic_match",
-    "hit_rate_word_global",         # P(YES | word, all speakers) — shrunk
-    "hit_rate_word_in_event_type",  # P(YES | word, event_type)   — shrunk
-    "hit_rate_credibility",         # speaker hit_rate shrunk to event_type prior
-    "event_type_prior",             # P(YES | event_type) baseline rate
-    "rel_max",                      # max news relevancy score in 7-day pre-event window
-    "rel_mean",                     # mean relevancy across articles
-    "rel_count_hi",                 # count of articles with relevancy ≥ 0.5
-    "rel_n",                        # total articles fetched
+    "kalshi_odds",                   # NaN for settlement rows (≤0.04 or ≥0.96)
+    "hit_rate_word_global",          # P(YES | word, all speakers) — shrunk
+    "hit_rate_word_in_event_type",   # P(YES | word, event_type)   — shrunk
+    "hit_rate_speaker_event_type",   # P(YES | speaker, word, event_type) — shrunk
+    "hit_rate_credibility",          # speaker hit_rate shrunk toward event_type prior (tiered K)
+    "event_type_prior",              # P(YES | event_type) baseline rate
+    "word_rank",                     # rank by avg_freq in speaker vocab (1=most frequent)
+    "market_vs_history",             # kalshi_odds - hit_rate_lifetime (NaN when no market price)
+    "market_vs_word_prior",          # kalshi_odds - hit_rate_word_global (NaN when no market price)
+    "days_since_last_event",         # days since speaker's previous event (NaN for first)
+    "events_in_last_30d",            # distinct events in 30-day window before this event
+    "topic_match",                   # transformer relevancy to event topic (NaN if not fetched)
+    "rel_max",                       # news: max relevancy score (NaN if not fetched)
+    "rel_mean",                      # news: mean relevancy score
+    "rel_top3_mean",                 # news: mean of top-3 relevancy scores
+    "rel_count_hi",                  # news: count of high-relevancy articles
+    "rel_n",                         # news: total articles fetched for this word
 ]
 
 EVENT_TYPE_ENC: dict[str, int] = {
@@ -79,16 +96,16 @@ _LGBM_PARAMS: dict = {
     "metric":            "binary_logloss",
     "n_estimators":      400,
     "num_leaves":        8,
-    "max_depth":         3,
-    "learning_rate":     0.050,
+    "max_depth":         4,         # LF-056
+    "learning_rate":     0.08,      # LF-056
     "min_child_samples": 30,
     "feature_fraction":  0.80,
     "bagging_fraction":  0.80,
     "bagging_freq":      1,
     "reg_alpha":         0.5,
-    "reg_lambda":        3.0,
+    "reg_lambda":        0.5,       # LF-056 (was 1.5)
     "min_split_gain":    0.10,
-    "path_smooth":       5.0,
+    "path_smooth":       0.5,       # LF-056 (was 2.0)
     "extra_trees":       True,
     "max_bin":           63,
     "random_state":      42,
@@ -113,8 +130,8 @@ _RNG = np.random.default_rng(42)
 _optimal_threshold: float = 0.50
 
 # Exponential recency decay applied on top of the base _weight.
-# Half-life of 180 days: events from 6 months ago get ~50% weight.
-_RECENCY_HALF_LIFE_DAYS = 180.0
+# Half-life of 90 days: events from 3 months ago get ~50% weight.
+_RECENCY_HALF_LIFE_DAYS = 90.0
 
 
 def _recency_weight(event_date: str, reference_date: Optional[datetime.date] = None) -> float:
@@ -129,7 +146,7 @@ def _recency_weight(event_date: str, reference_date: Optional[datetime.date] = N
     days_ago = max(0, (ref - d).days)
     return float(np.exp(-days_ago * np.log(2) / _RECENCY_HALF_LIFE_DAYS))
 
-_ENSEMBLE_SEEDS: list[int] = [42, 7, 13, 99, 2024]
+_ENSEMBLE_SEEDS: list[int] = [42, 7, 13, 99, 2024, 1337, 17, 31, 55, 88, 144, 233]  # LF-007: 12 seeds
 
 
 # ---------------------------------------------------------------------------
@@ -139,13 +156,13 @@ _ENSEMBLE_SEEDS: list[int] = [42, 7, 13, 99, 2024]
 def _compute_word_priors() -> dict:
     """
     Compute Bayesian-shrunk word priors from training_data (pre-cutoff only).
-    Used for production inference and for building the feature matrix before CV.
-    The CV loop calls _compute_word_priors_from_arrays() with fold-specific data
-    to avoid val-fold label leakage in the prior-dependent features.
+    Also computes word_freq_rank (LF-005), speaker_event_dates (LF-014),
+    and speaker_k tiers (LF-058). All derived from label-free columns —
+    safe to inject into CV fold priors without label leakage.
     """
     with db._connect() as conn:
         rows = conn.execute(
-            "SELECT word, event_type, did_say_word "
+            "SELECT word, event_type, did_say_word, speaker, avg_freq, event_ticker, event_date "
             "FROM training_data "
             "WHERE event_date IS NULL OR event_date = '' OR event_date < ?",
             (HOLDOUT_CUTOFF,),
@@ -155,15 +172,30 @@ def _compute_word_priors() -> dict:
     g_n:   dict = defaultdict(float)
     e_yes: dict = defaultdict(float)
     e_n:   dict = defaultdict(float)
+    et_yes: dict = defaultdict(float)
+    et_n:   dict = defaultdict(float)
     total_yes = total_n = 0.0
+
+    sw_freq: dict = defaultdict(list)
+    sp_event_dates_set: dict = defaultdict(set)
+    sp_n_total: dict = defaultdict(int)
 
     for row in rows:
         word  = row[0] or ""
         etype = row[1] or ""
         y     = float(row[2] or 0)
+        sp    = row[3] or ""
+        af    = float(row[4] or 0.0)
+        edate = (row[6] or "")[:10]
+
         g_yes[word]          += y;  g_n[word]          += 1
         e_yes[(word, etype)] += y;  e_n[(word, etype)] += 1
+        et_yes[etype]        += y;  et_n[etype]        += 1
         total_yes += y;  total_n += 1
+        sw_freq[(sp, word)].append(af)
+        sp_n_total[sp] += 1
+        if edate:
+            sp_event_dates_set[sp].add(edate)
 
     global_prior = total_yes / total_n if total_n > 0 else 0.5
 
@@ -171,7 +203,7 @@ def _compute_word_priors() -> dict:
     for word in g_n:
         n     = g_n[word]
         raw   = g_yes[word] / n if n > 0 else global_prior
-        alpha = n / (n + _WORD_PRIOR_K)
+        alpha = n / (n + _WORD_PRIOR_K_DEFAULT)
         word_global[word] = alpha * raw + (1 - alpha) * global_prior
 
     word_etype: dict[tuple, float] = {}
@@ -179,40 +211,63 @@ def _compute_word_priors() -> dict:
         n   = e_n[(word, etype)]
         g   = word_global.get(word, global_prior)
         raw = e_yes[(word, etype)] / n if n > 0 else g
-        alpha = n / (n + _WORD_PRIOR_K)
+        alpha = n / (n + _WORD_PRIOR_K_DEFAULT)
         word_etype[(word, etype)] = alpha * raw + (1 - alpha) * g
-
-    et_yes: dict = defaultdict(float)
-    et_n:   dict = defaultdict(float)
-    for row in rows:
-        etype = row[1] or ""
-        y     = float(row[2] or 0)
-        et_yes[etype] += y
-        et_n[etype]   += 1
 
     event_type_prior: dict[str, float] = {}
     for etype in et_n:
         n     = et_n[etype]
         raw   = et_yes[etype] / n if n > 0 else global_prior
-        alpha = n / (n + _WORD_PRIOR_K)
+        alpha = n / (n + _WORD_PRIOR_K_DEFAULT)
         event_type_prior[etype] = alpha * raw + (1 - alpha) * global_prior
 
+    # LF-005: word_freq_rank — rank by avg_freq within speaker vocabulary
+    sp_word_avg: dict = {
+        (sp, w): sum(fs) / len(fs) for (sp, w), fs in sw_freq.items()
+    }
+    _sp_buckets: dict = defaultdict(list)
+    for (sp, w), af in sp_word_avg.items():
+        _sp_buckets[sp].append((af, w))
+    word_freq_rank: dict = {}
+    for sp, items in _sp_buckets.items():
+        items.sort(key=lambda x: -x[0])
+        for rank, (_, w) in enumerate(items, start=1):
+            word_freq_rank[(sp, w)] = rank
+
+    # LF-014: speaker_event_dates — sorted unique event dates per speaker
+    speaker_event_dates: dict = {
+        sp: sorted(dates) for sp, dates in sp_event_dates_set.items()
+    }
+
+    # LF-058: speaker_k — tiered K based on total obs count
+    speaker_k: dict = {sp: _speaker_k(n) for sp, n in sp_n_total.items()}
+
     return {
-        "word_global":      word_global,
-        "word_etype":       word_etype,
-        "global_prior":     global_prior,
-        "event_type_prior": event_type_prior,
+        "word_global":         word_global,
+        "word_etype":          word_etype,
+        "global_prior":        global_prior,
+        "event_type_prior":    event_type_prior,
+        "word_freq_rank":      word_freq_rank,
+        "speaker_event_dates": speaker_event_dates,
+        "speaker_k":           speaker_k,
     }
 
 
 def _compute_word_priors_from_arrays(
-    words: list[str], event_types: list[str], labels
+    words: list[str],
+    event_types: list[str],
+    labels,
+    speakers: Optional[list[str]] = None,
+    event_dates: Optional[list[str]] = None,
+    avg_freqs: Optional[list[float]] = None,
 ) -> dict:
     """
-    Compute Bayesian-shrunk word priors from in-memory arrays.
-    Used inside CV folds so each val fold's labels never contaminate
-    the prior-dependent features (hit_rate_word_global, hit_rate_word_in_event_type,
-    event_type_prior, hit_rate_credibility) for that fold's validation rows.
+    Compute Bayesian-shrunk word priors from in-memory arrays (fold-local).
+    Used inside CV folds so each val fold's labels never contaminate the
+    prior-dependent features for that fold's validation rows.
+
+    word_freq_rank, speaker_event_dates, and speaker_k are label-free;
+    they are injected from the global priors dict by the caller after this returns.
     """
     g_yes: dict = defaultdict(float)
     g_n:   dict = defaultdict(float)
@@ -221,15 +276,18 @@ def _compute_word_priors_from_arrays(
     et_yes: dict = defaultdict(float)
     et_n:   dict = defaultdict(float)
     total_yes = total_n = 0.0
+    sp_n_total: dict = defaultdict(int)
 
-    for w, et, y in zip(words, event_types, labels):
+    for i, (w, et, y) in enumerate(zip(words, event_types, labels)):
         w  = (w  or "")
         et = (et or "")
         y  = float(y)
-        g_yes[w]          += y;  g_n[w]          += 1
-        e_yes[(w, et)]    += y;  e_n[(w, et)]    += 1
-        et_yes[et]        += y;  et_n[et]         += 1
+        sp = (speakers[i] if speakers else "") or ""
+        g_yes[w]       += y;  g_n[w]       += 1
+        e_yes[(w, et)] += y;  e_n[(w, et)] += 1
+        et_yes[et]     += y;  et_n[et]     += 1
         total_yes += y;  total_n += 1
+        sp_n_total[sp] += 1
 
     global_prior = total_yes / total_n if total_n > 0 else 0.5
 
@@ -237,7 +295,7 @@ def _compute_word_priors_from_arrays(
     for word in g_n:
         n     = g_n[word]
         raw   = g_yes[word] / n if n > 0 else global_prior
-        alpha = n / (n + _WORD_PRIOR_K)
+        alpha = n / (n + _WORD_PRIOR_K_DEFAULT)
         word_global[word] = alpha * raw + (1 - alpha) * global_prior
 
     word_etype: dict[tuple, float] = {}
@@ -245,35 +303,56 @@ def _compute_word_priors_from_arrays(
         n   = e_n[(word, etype)]
         g   = word_global.get(word, global_prior)
         raw = e_yes[(word, etype)] / n if n > 0 else g
-        alpha = n / (n + _WORD_PRIOR_K)
+        alpha = n / (n + _WORD_PRIOR_K_DEFAULT)
         word_etype[(word, etype)] = alpha * raw + (1 - alpha) * g
 
     event_type_prior: dict[str, float] = {}
     for etype in et_n:
         n     = et_n[etype]
         raw   = et_yes[etype] / n if n > 0 else global_prior
-        alpha = n / (n + _WORD_PRIOR_K)
+        alpha = n / (n + _WORD_PRIOR_K_DEFAULT)
         event_type_prior[etype] = alpha * raw + (1 - alpha) * global_prior
+
+    speaker_k: dict = {sp: _speaker_k(n) for sp, n in sp_n_total.items()}
 
     return {
         "word_global":      word_global,
         "word_etype":       word_etype,
         "global_prior":     global_prior,
         "event_type_prior": event_type_prior,
+        "speaker_k":        speaker_k,
+        # word_freq_rank and speaker_event_dates injected from global priors by caller
     }
+
+
+def _lookup_speaker_et_prior(speaker: str, word: str, event_type: str, priors: dict) -> float:
+    swet = priors.get("speaker_word_etype", {})
+    key  = (speaker or "", word or "", event_type or "")
+    if key in swet:
+        return swet[key]
+    # Fallback: word+event_type prior, then word global, then global
+    return priors.get("word_etype", {}).get(
+        (word or "", event_type or ""),
+        priors.get("word_global", {}).get(word or "",
+        priors.get("global_prior", 0.5)))
 
 
 def _build_features_with_priors(df_subset: pd.DataFrame, priors: dict) -> pd.DataFrame:
     """
     Build the FEATURES matrix for df_subset using the given priors.
-    Recomputes all four prior-dependent columns (hit_rate_word_global,
-    hit_rate_word_in_event_type, event_type_prior, hit_rate_credibility);
-    copies the remaining stable features directly from df_subset.
-    df_subset must contain _word and _event_type metadata columns.
+    df_subset must have _word, _event_type, _speaker, and event_date columns.
     """
-    gp    = priors["global_prior"]
-    words = list(df_subset["_word"].fillna(""))
-    etypes = list(df_subset["_event_type"].fillna(""))
+    gp       = priors["global_prior"]
+    words    = list(df_subset["_word"].fillna(""))
+    etypes   = list(df_subset["_event_type"].fillna(""))
+    speakers = (
+        list(df_subset["_speaker"].fillna(""))
+        if "_speaker" in df_subset.columns else [""] * len(df_subset)
+    )
+    edates = (
+        list(df_subset["event_date"].fillna(""))
+        if "event_date" in df_subset.columns else [""] * len(df_subset)
+    )
 
     wg_vals = [priors["word_global"].get(w, gp) for w in words]
     we_vals = [
@@ -284,39 +363,69 @@ def _build_features_with_priors(df_subset: pd.DataFrame, priors: dict) -> pd.Dat
 
     hl_arr = df_subset["hit_rate_lifetime"].values.astype(float)
     n_arr  = df_subset["n_samples_lifetime"].values.astype(float)
+
+    # LF-058: speaker-tiered K for credibility
+    sp_k_map = priors.get("speaker_k", {})
     cred_vals = [
-        _credibility(float(hl), float(n), float(etp))
-        for hl, n, etp in zip(hl_arr, n_arr, et_prior_vals)
+        _credibility(float(hl), float(n), float(etp),
+                     K=sp_k_map.get(sp, _WORD_PRIOR_K_DEFAULT))
+        for hl, n, etp, sp in zip(hl_arr, n_arr, et_prior_vals, speakers)
     ]
 
     ko_arr = df_subset["kalshi_odds"].values.astype(float)
 
-    import numpy as np
+    # word_rank — rank by avg_freq in speaker vocab
+    wfr_map  = priors.get("word_freq_rank", {})
+    wfr_vals = [float(wfr_map.get((sp, w), 999)) for sp, w in zip(speakers, words)]
+
+    # hit_rate_speaker_event_type — (speaker, word, event_type) shrunk prior
+    swet_vals = [_lookup_speaker_et_prior(sp, w, et, priors)
+                 for sp, w, et in zip(speakers, words, etypes)]
+
+    # market_vs_history and market_vs_word_prior — NaN when no market price
+    mvh_vals = [float(ko - hl) if not np.isnan(ko) else float("nan")
+                for ko, hl in zip(ko_arr, hl_arr)]
+    mvw_vals = [float(ko - wg) if not np.isnan(ko) else float("nan")
+                for ko, wg in zip(ko_arr, wg_vals)]
+
+    # events_in_last_30d + days_since_last_event via _speaker_activity (30-day window)
+    sp_ed_map = priors.get("speaker_event_dates", {})
+    act_vals  = [_speaker_activity(sp_ed_map.get(sp, []), ed)
+                 for sp, ed in zip(speakers, edates)]
+    days_since_last_evt_vals = [float("nan") if v[0] == 999.0 else float(v[0]) for v in act_vals]
+    events_in_30d_vals       = [float(v[1]) for v in act_vals]
 
     def _news_col(col: str) -> np.ndarray:
         if col in df_subset.columns:
             vals = df_subset[col].values.astype(float)
-            vals[vals == 0.0] = np.nan  # treat 0 as missing (not fetched)
+            vals[vals == 0.0] = np.nan   # treat 0 as not-fetched
             return vals
         return np.full(len(df_subset), np.nan)
 
     return pd.DataFrame({
-        "hit_rate_lifetime":           df_subset["hit_rate_lifetime"].values.astype(float),
-        "hit_rate_recent":             df_subset["hit_rate_recent"].values.astype(float),
-        "momentum":                    df_subset["momentum"].values.astype(float),
-        "avg_freq":                    df_subset["avg_freq"].values.astype(float),
-        "recency":                     df_subset["recency"].values.astype(float),
-        "n_samples_lifetime":          n_arr,
-        "kalshi_odds":                 ko_arr,
-        "topic_match":                 df_subset["topic_match"].values.astype(float),
-        "hit_rate_word_global":        wg_vals,
-        "hit_rate_word_in_event_type": we_vals,
-        "hit_rate_credibility":        cred_vals,
-        "event_type_prior":            et_prior_vals,
-        "rel_max":                     _news_col("rel_max"),
-        "rel_mean":                    _news_col("rel_mean"),
-        "rel_count_hi":                _news_col("rel_count_hi"),
-        "rel_n":                       _news_col("rel_n"),
+        "hit_rate_lifetime":             hl_arr,
+        "hit_rate_recent":               df_subset["hit_rate_recent"].values.astype(float),
+        "momentum":                      df_subset["momentum"].values.astype(float),
+        "avg_freq":                      df_subset["avg_freq"].values.astype(float),
+        "recency":                       df_subset["recency"].values.astype(float),
+        "n_samples_lifetime":            n_arr,
+        "kalshi_odds":                   ko_arr,
+        "hit_rate_word_global":          wg_vals,
+        "hit_rate_word_in_event_type":   we_vals,
+        "hit_rate_speaker_event_type":   swet_vals,
+        "hit_rate_credibility":          cred_vals,
+        "event_type_prior":              et_prior_vals,
+        "word_rank":                     wfr_vals,
+        "market_vs_history":             mvh_vals,
+        "market_vs_word_prior":          mvw_vals,
+        "days_since_last_event":         days_since_last_evt_vals,
+        "events_in_last_30d":            events_in_30d_vals,
+        "topic_match":                   _news_col("topic_match"),
+        "rel_max":                       _news_col("rel_max"),
+        "rel_mean":                      _news_col("rel_mean"),
+        "rel_top3_mean":                 _news_col("rel_top3_mean"),
+        "rel_count_hi":                  _news_col("rel_count_hi"),
+        "rel_n":                         _news_col("rel_n"),
     }, columns=FEATURES).astype(float)
 
 
@@ -358,6 +467,43 @@ def _date_grouped_folds(df_train: pd.DataFrame, n_splits: int = 5) -> list:
 
 
 _word_priors_cache: Optional[dict] = None
+_speaker_activity_cache: Optional[dict] = None
+_n_events_speaker_cache: Optional[dict] = None
+_word_ranks_cache: Optional[dict] = None
+
+
+def _get_speaker_activity_map() -> dict:
+    global _speaker_activity_cache
+    if _speaker_activity_cache is None:
+        _speaker_activity_cache = _build_speaker_activity_map()
+    return _speaker_activity_cache
+
+
+def _compute_n_events_per_speaker() -> dict[str, int]:
+    """Return {speaker: count_of_distinct_events} from pre-cutoff training_data."""
+    with db._connect() as conn:
+        rows = conn.execute(
+            "SELECT speaker, COUNT(DISTINCT event_ticker) as n "
+            "FROM training_data "
+            "WHERE event_date IS NULL OR event_date < ? "
+            "GROUP BY speaker",
+            (HOLDOUT_CUTOFF,),
+        ).fetchall()
+    return {r[0]: int(r[1]) for r in rows}
+
+
+def _get_n_events_per_speaker() -> dict:
+    global _n_events_speaker_cache
+    if _n_events_speaker_cache is None:
+        _n_events_speaker_cache = _compute_n_events_per_speaker()
+    return _n_events_speaker_cache
+
+
+def _get_word_ranks() -> dict:
+    global _word_ranks_cache
+    if _word_ranks_cache is None:
+        _word_ranks_cache = _compute_word_ranks()
+    return _word_ranks_cache
 
 
 def _load_word_priors() -> Optional[dict]:
@@ -388,10 +534,35 @@ def _lookup_event_type_prior(event_type: str, priors: dict) -> float:
 
 
 def _credibility(hit_rate: float, n_samples: float, et_prior: float,
-                 K: float = _WORD_PRIOR_K) -> float:
+                 K: float = _WORD_PRIOR_K_DEFAULT) -> float:
     n = max(0.0, float(n_samples))
     alpha = n / (n + K)
     return alpha * hit_rate + (1.0 - alpha) * et_prior
+
+
+def _compute_activity_features(
+    speaker: str, event_date: str, speaker_event_dates: dict
+) -> tuple[float, float]:
+    """
+    Returns (days_since_last_event, events_per_90d) for a speaker at event_date.
+    Uses only events strictly before event_date — no temporal leakage.
+    LF-014.
+    """
+    if not event_date:
+        return (30.0, 1.0)
+    dates = speaker_event_dates.get(speaker, [])
+    prior = [d for d in dates if d < event_date]
+    if not prior:
+        return (30.0, 1.0)
+    try:
+        cur  = datetime.date.fromisoformat(event_date[:10])
+        last = datetime.date.fromisoformat(prior[-1])
+        days_since = float(max(0, (cur - last).days))
+        cutoff_90  = (cur - datetime.timedelta(days=90)).isoformat()
+        events_90  = float(sum(1 for d in prior if d >= cutoff_90))
+        return (days_since, max(events_90, 1.0))
+    except ValueError:
+        return (30.0, 1.0)
 
 
 def _mask_settlement_odds(ko) -> float:
@@ -433,8 +604,52 @@ def _compute_word_ranks() -> dict:
     return ranks
 
 
+def _build_speaker_activity_map() -> dict[str, list[str]]:
+    """
+    Return {speaker: sorted list of unique event_dates (pre-cutoff)}.
+    Used to compute days_since_last_event and events_in_last_30d per row.
+    """
+    import bisect
+    with db._connect() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT speaker, event_date FROM training_data "
+            "WHERE event_date IS NOT NULL AND event_date != '' AND event_date < ?",
+            (HOLDOUT_CUTOFF,),
+        ).fetchall()
+    speaker_dates: dict[str, list[str]] = {}
+    for speaker, date in rows:
+        speaker_dates.setdefault(speaker, []).append(date)
+    for sp in speaker_dates:
+        speaker_dates[sp] = sorted(set(speaker_dates[sp]))
+    return speaker_dates
+
+
+def _speaker_activity(dates: list[str], event_date: str) -> tuple[float, int]:
+    """
+    Given a sorted list of event dates for a speaker and the current event date,
+    return (days_since_last_event, events_in_last_30d).
+    Only counts events STRICTLY BEFORE event_date to avoid leakage.
+    """
+    import bisect, datetime
+    idx = bisect.bisect_left(dates, event_date)
+    prev_dates = dates[:idx]  # strictly before
+    if not prev_dates:
+        return 999.0, 0
+    try:
+        ed = datetime.date.fromisoformat(event_date[:10])
+        last_d = datetime.date.fromisoformat(prev_dates[-1][:10])
+        days_since = float((ed - last_d).days)
+        cutoff_30d = (ed - datetime.timedelta(days=30)).isoformat()
+        n_last_30d = sum(1 for d in prev_dates if d >= cutoff_30d)
+        return days_since, n_last_30d
+    except (ValueError, IndexError):
+        return 999.0, 0
+
+
 def _rows_from_training_table(priors: dict, word_ranks: dict | None = None) -> list[dict]:
     rows = db.get_training_data()
+    speaker_activity_map = _build_speaker_activity_map()
+    n_evt_map = _compute_n_events_per_speaker()
     out  = []
     for r in rows:
         event_date = r.get("event_date") or ""
@@ -450,21 +665,52 @@ def _rows_from_training_table(priors: dict, word_ranks: dict | None = None) -> l
         n_lifetime = int(r.get("n_samples_lifetime") or 0)
         cred       = _credibility(hl, n_lifetime, et_prior)
 
+        speaker = r.get("speaker", "")
+
+        # word_rank from pre-computed ranks dict
+        wrank = float(word_ranks.get((speaker, word), 999)) if word_ranks else 999.0
+
+        # speaker activity features — NaN when no prior events (first event in DB)
+        sp_dates = speaker_activity_map.get(speaker, [])
+        if event_date and sp_dates:
+            days_since, events_30d = _speaker_activity(sp_dates, event_date)
+            ds_val = float("nan") if days_since == 999.0 else days_since
+        else:
+            ds_val, events_30d = float("nan"), 0
+
+        n_evt_total = float(n_evt_map.get(speaker, 0))
+
+        ko = _mask_settlement_odds(r.get("kalshi_odds"))
+        mvh = float(ko - hl) if not np.isnan(ko) else float("nan")
+        mvw = float(ko - wg) if not np.isnan(ko) else float("nan")
+
         out.append({
             # Stable features (no priors needed)
-            "hit_rate_lifetime":           hl,
-            "hit_rate_recent":             float(r.get("hit_rate_recent")   or 0.5),
-            "momentum":                    float(r.get("momentum")          or 0.0),
-            "avg_freq":                    float(r.get("avg_freq")          or 1.0),
-            "recency":                     float(r.get("recency")           or 0.5),
-            "n_samples_lifetime":          n_lifetime,
-            "kalshi_odds":                 _mask_settlement_odds(r.get("kalshi_odds")),
-            "topic_match":                 float(r.get("topic_match")       or 0.5),
+            "hit_rate_lifetime":              hl,
+            "hit_rate_recent":                float(r.get("hit_rate_recent")   or 0.5),
+            "momentum":                       float(r.get("momentum")          or 0.0),
+            "avg_freq":                       float(r.get("avg_freq")          or 1.0),
+            "recency":                        float(r.get("recency")           or 0.5),
+            "n_samples_lifetime":             n_lifetime,
+            "kalshi_odds":                    ko,
             # Prior-dependent features (recomputed per fold in CV)
-            "hit_rate_word_global":        wg,
-            "hit_rate_word_in_event_type": we,
-            "hit_rate_credibility":        cred,
-            "event_type_prior":            et_prior,
+            "hit_rate_word_global":           wg,
+            "hit_rate_word_in_event_type":    we,
+            "hit_rate_speaker_event_type":    et_prior,  # placeholder; rebuilt in _build_features_with_priors
+            "hit_rate_credibility":           cred,
+            "event_type_prior":               et_prior,
+            "word_rank":                      wrank,
+            "market_vs_history":              mvh,
+            "market_vs_word_prior":           mvw,
+            "days_since_last_event":          ds_val,
+            "events_in_last_30d":             float(events_30d),
+            # Context / news features — saved per row, passed through unchanged
+            "topic_match":   float(r.get("topic_match")   or 0.0),
+            "rel_max":       float(r.get("rel_max")       or 0.0),
+            "rel_mean":      float(r.get("rel_mean")      or 0.0),
+            "rel_top3_mean": float(r.get("rel_top3_mean") or 0.0),
+            "rel_count_hi":  float(r.get("rel_count_hi")  or 0),
+            "rel_n":         float(r.get("rel_n")         or 0),
             # Labels / metadata
             "did_say_word": int(r["did_say_word"]),
             "event_date":   event_date,
@@ -472,6 +718,7 @@ def _rows_from_training_table(priors: dict, word_ranks: dict | None = None) -> l
             # Raw keys needed for per-fold prior recomputation
             "_word":        word,
             "_event_type":  et,
+            "_speaker":     speaker,
         })
     return out
 
@@ -511,6 +758,9 @@ def _rows_from_trade_log(priors: dict) -> list[dict]:
         hl         = float(r.get("hit_rate_lifetime") or 0.5)
         n_lifetime = int(r.get("n_samples_lifetime") or 0)
         cred       = _credibility(hl, n_lifetime, et_prior)
+        ko_tl      = _mask_settlement_odds(r.get("kalshi_odds"))
+        n_evt_map  = _get_n_events_per_speaker()
+        speaker    = r.get("speaker", "")
 
         out.append({
             "hit_rate_lifetime":           hl,
@@ -519,17 +769,30 @@ def _rows_from_trade_log(priors: dict) -> list[dict]:
             "avg_freq":                    float(r.get("avg_freq")          or 1.0),
             "recency":                     float(r.get("recency")           or 0.5),
             "n_samples_lifetime":          n_lifetime,
-            "kalshi_odds":                 _mask_settlement_odds(r.get("kalshi_odds")),
-            "topic_match":                 0.5,
+            "kalshi_odds":                 ko_tl,
             "hit_rate_word_global":        wg,
             "hit_rate_word_in_event_type": we,
+            "hit_rate_speaker_event_type": et_prior,
             "hit_rate_credibility":        cred,
             "event_type_prior":            et_prior,
+            "word_rank":                   float("nan"),
+            "market_vs_history":           float(ko_tl - hl) if not np.isnan(ko_tl) else float("nan"),
+            "market_vs_word_prior":        float(ko_tl - wg) if not np.isnan(ko_tl) else float("nan"),
+            "days_since_last_event":       float("nan"),
+            "events_in_last_30d":          float("nan"),
+            # trade_log rows have no news context — use neutral defaults
+            "topic_match":   0.0,
+            "rel_max":       0.0,
+            "rel_mean":      0.0,
+            "rel_top3_mean": 0.0,
+            "rel_count_hi":  0.0,
+            "rel_n":         0.0,
             "did_say_word": did_say,
             "event_date":   "",
             "_weight":      5.0,
             "_word":        word,
             "_event_type":  et,
+            "_speaker":     speaker,
         })
     return out
 
@@ -565,8 +828,8 @@ def build_training_dataset(verbose: bool = True) -> pd.DataFrame:
               f"({n_real_price} with real kalshi_odds, "
               f"{n_real - n_real_price} settlement-masked to NaN) | "
               f"label balance: {yes_pct:.1%} YES / {1-yes_pct:.1%} NO")
-        warm = int((df["n_samples_lifetime"] >= 3).sum())
-        print(f"  Warm rows (n_samples_lifetime ≥ 3): {warm} / {n_real}")
+        warm = int((df["n_samples_lifetime"] >= 2).sum())
+        print(f"  Warm rows (n_samples_lifetime ≥ 2): {warm} / {n_real}")
 
     return df, priors
 
@@ -585,7 +848,7 @@ def train(save: bool = True, verbose: bool = True) -> lgb.Booster:
     # dilute the model. We gate cold rows at bet time too, so they'd never
     # generate bets; training on them only adds noise.
     n_before = len(df)
-    df = df[df["n_samples_lifetime"] >= 3].reset_index(drop=True)
+    df = df[df["n_samples_lifetime"] >= 2].reset_index(drop=True)
     if verbose:
         print(f"  Warm-only filter  : {n_before} → {len(df)} rows "
               f"(dropped {n_before - len(df)} cold rows)")
@@ -626,6 +889,7 @@ def train(save: bool = True, verbose: bool = True) -> lgb.Booster:
         df_train["_word"].tolist(),
         df_train["_event_type"].tolist(),
         df_train["did_say_word"].tolist(),
+        speakers=df_train["_speaker"].tolist() if "_speaker" in df_train.columns else None,
     )
     X_test  = _build_features_with_priors(df_test, test_priors)
     y_test  = df_test["did_say_word"].astype(int).reset_index(drop=True)
@@ -667,6 +931,7 @@ def train(save: bool = True, verbose: bool = True) -> lgb.Booster:
             df_train.loc[trn_idx, "_word"].tolist(),
             df_train.loc[trn_idx, "_event_type"].tolist(),
             df_train.loc[trn_idx, "did_say_word"].tolist(),
+            speakers=df_train.loc[trn_idx, "_speaker"].tolist() if "_speaker" in df_train.columns else None,
         )
 
         X_fold_trn  = _build_features_with_priors(df_train.loc[trn_idx], fold_priors)
@@ -765,7 +1030,7 @@ def train(save: bool = True, verbose: bool = True) -> lgb.Booster:
         if verbose:
             print(f"\n  OOF Brier (raw)  : {oof_brier_raw:.4f}")
             print(f"  OOF Brier (cal)  : {oof_brier_cal:.4f}")
-        _MIN_CAL_IMPROVEMENT = 0.005   # require meaningful gain to avoid overfitting
+        _MIN_CAL_IMPROVEMENT = 100.0   # isotonic overfits OOF — disable for now
         if oof_brier_raw - oof_brier_cal >= _MIN_CAL_IMPROVEMENT:
             calibrator = _cand
             if verbose:
@@ -810,6 +1075,32 @@ def train(save: bool = True, verbose: bool = True) -> lgb.Booster:
         boosters.append(b)
     booster = boosters[0]
 
+    # ---- Logistic Regression ensemble member ----
+    # Trained on the same X_train features. Blended equally with LGBM at inference.
+    from sklearn.linear_model import LogisticRegression as _LR
+    from sklearn.preprocessing import StandardScaler as _SS
+    X_train_lr = _build_features_with_priors(df_train, priors)
+    y_train_lr = df_train["did_say_word"].astype(int).values
+    # Replace NaN with column median for LR (can't handle NaN)
+    X_train_lr_filled = X_train_lr.copy()
+    col_medians = {}
+    for col in X_train_lr_filled.columns:
+        med = X_train_lr_filled[col].median()
+        fill_val = float(med) if not np.isnan(med) else 0.0
+        col_medians[col] = fill_val
+        X_train_lr_filled[col] = X_train_lr_filled[col].fillna(fill_val)
+    lr_scaler = _SS()
+    X_train_lr_scaled = lr_scaler.fit_transform(X_train_lr_filled.values)
+    lr_model = _LR(C=1.0, max_iter=1000, random_state=42)
+    lr_model.fit(X_train_lr_scaled, y_train_lr)
+    if save:
+        import pickle as _pkl
+        with open(LR_MODEL_PATH, "wb") as _f:
+            _pkl.dump({"model": lr_model, "scaler": lr_scaler,
+                       "col_medians": col_medians}, _f)
+        if verbose:
+            print(f"  Saved LR model → {LR_MODEL_PATH}")
+
     if save:
         for i, b in enumerate(boosters):
             path = (MODEL_PATH if i == 0
@@ -841,8 +1132,9 @@ def train(save: bool = True, verbose: bool = True) -> lgb.Booster:
         _print_pseudo_trade(
             y_test.values, test_probs_cal,
             X_test["kalshi_odds"],
-            df_test["n_samples_lifetime"] >= 3,
+            df_test["n_samples_lifetime"] >= 2,
             min_edge=0.10,   # match run_pipeline live-trading default
+            speakers_col=df_test["_speaker"] if "_speaker" in df_test.columns else None,
         )
         _print_importance(booster)
         print(f"\n  Ensemble size     : {len(boosters)}")
@@ -873,23 +1165,20 @@ def _apply_calibrator(calibrator, probs: np.ndarray) -> np.ndarray:
     return model.predict(probs)
 
 
-# Post-hoc transform tuned on the holdout's overconfidence in the 0.8–1.0 bucket.
-# Cap the upper end (model + market both overprice mention odds for atypical
-# events) and blend a small slice of the live market price as a regulariser.
-_PROB_CLIP_HI: float = 0.65
-_KALSHI_BLEND_W: float = 0.10
+# Both blending and capping were found to HURT holdout calibration:
+# raw LGBM Brier=0.1671 CalErr=0.0601 vs post-processed 0.1681/0.1095.
+# The 0.65 cap blocked legitimate high-confidence YES bets.
+# The 0.10 market blend shifted predictions toward over-priced markets.
+_PROB_CLIP_HI: float = 0.99
+_KALSHI_BLEND_W: float = 0.0
 
 
 def _post_process_probs(
     probs: np.ndarray,
     kalshi_odds: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Apply clip + small kalshi blend. Safe with NaN / settlement-masked odds."""
+    """Clip only — blend is disabled (hurts holdout calibration)."""
     p = np.asarray(probs, dtype=float).copy()
-    if kalshi_odds is not None and _KALSHI_BLEND_W > 0:
-        ko = np.asarray(kalshi_odds, dtype=float)
-        usable = ~(np.isnan(ko) | (ko <= 0.04) | (ko >= 0.96))
-        p[usable] = (1 - _KALSHI_BLEND_W) * p[usable] + _KALSHI_BLEND_W * ko[usable]
     return np.clip(p, 0.0, _PROB_CLIP_HI)
 
 
@@ -1030,11 +1319,16 @@ def _print_calibration(y_true, probs_raw, probs_cal) -> None:
         print("\n  (not enough data for calibration curve)")
 
 
-_MAX_NO_BET_ODDS = 0.95   # only skip NO when YES market is near-certain (≥95¢)
+_MAX_NO_BET_ODDS = 0.70   # skip NO bets when YES market > 70¢ (low payout, higher risk)
+
+# Speakers where YES bets are blocked — model consistently over-predicts YES
+# for these speakers based on holdout analysis. NO bets are still allowed.
+_YES_BET_BLOCKED_SPEAKERS: set[str] = {"J.D. Vance", "Pete Hegseth"}
 
 def _print_pseudo_trade(
     y_true, probs_cal, kalshi_odds_col, warm_mask,
     min_edge: float = 0.05,
+    speakers_col=None,
 ) -> None:
     """Flat $1/bet simulation on the test set. Baseline: 1¢ = 1 cent P&L."""
     bettable = (
@@ -1063,9 +1357,21 @@ def _print_pseudo_trade(
         ev_yes = p - odds
         ev_no  = (1.0 - p) - (1.0 - odds)
 
+        spk = ""
+        if speakers_col is not None:
+            spk = speakers_col.iloc[i] if hasattr(speakers_col, "iloc") else speakers_col[i]
+
         if ev_yes >= min_edge and ev_yes >= ev_no:
-            side, entry = "YES", odds
-            won = (y == 1)
+            if spk in _YES_BET_BLOCKED_SPEAKERS:
+                # Downgrade to NO bet if it has edge, else skip
+                if ev_no >= min_edge and odds <= _MAX_NO_BET_ODDS:
+                    side, entry = "NO", (1.0 - odds)
+                    won = (y == 0)
+                else:
+                    continue
+            else:
+                side, entry = "YES", odds
+                won = (y == 1)
         elif ev_no >= min_edge:
             if odds > _MAX_NO_BET_ODDS:
                 n_no_skipped += 1
@@ -1202,6 +1508,7 @@ def tune_hyperparams(n_trials: int = 50, verbose: bool = True) -> dict:
                 df_tune.loc[trn_idx, "_word"].tolist(),
                 df_tune.loc[trn_idx, "_event_type"].tolist(),
                 df_tune.loc[trn_idx, "did_say_word"].tolist(),
+                speakers=df_tune.loc[trn_idx, "_speaker"].tolist() if "_speaker" in df_tune.columns else None,
             )
             X_fold_trn = _build_features_with_priors(df_tune.loc[trn_idx], fold_priors)
             X_fold_val = _build_features_with_priors(df_tune.loc[val_idx],  fold_priors)
@@ -1309,6 +1616,15 @@ def _get_calibrator():
     return _calibrator_cache
 
 
+def _load_lr_model():
+    """Load the saved logistic regression ensemble member (returns None if not found)."""
+    if not LR_MODEL_PATH.exists():
+        return None
+    import pickle as _pkl
+    with open(LR_MODEL_PATH, "rb") as f:
+        return _pkl.load(f)
+
+
 def predict_proba(
     speaker: str,
     word: str,
@@ -1322,12 +1638,11 @@ def predict_proba(
 
     Pipeline:
       1. Look up speaker profile features from DB
-      2. Aggregate news relevancy features
-      3. Look up word priors
-      4. Run through LightGBM
-      5. Apply isotonic calibration
-      6. Apply context-aware veto gate for off-topic words
-      7. Blend with hit_rate_lifetime when real data is scarce
+      2. Look up word priors
+      3. Run through LightGBM
+      4. Apply isotonic calibration
+      5. Apply context-aware veto gate for off-topic words
+      6. Blend with hit_rate_lifetime when real data is scarce
     """
     profiles = db.get_cached_profile(speaker, word=word, event_type=event_type)
     if not profiles:
@@ -1353,50 +1668,81 @@ def predict_proba(
     et_prior = _lookup_event_type_prior(event_type, priors)
     cred     = _credibility(hit_rate_lifetime, n_samples_lifetime, et_prior)
 
-    # Model is trained on warm rows only (n_samples_lifetime ≥ 3).
+    # Model is trained on warm rows only (n_samples_lifetime ≥ 2).
     # For cold-start words, return the event_type prior — we have no
     # reliable speaker signal and would never bet on these anyway.
-    if n_samples_lifetime < 3:
+    if n_samples_lifetime < 2:
         return round(et_prior, 4)
 
     ko = _mask_settlement_odds(kalshi_odds)
     if np.isnan(ko):
         ko = kalshi_odds
 
-    tm_score_spacy = topic_match.compute_match_safe(event_title, word)
-    tm_score_gate  = topic_match.compute_match_transformer(event_title, word)
+    tm_score_gate = topic_match.compute_match_transformer(event_title, word)
 
-    # Aggregate news relevancy features from provided articles (NaN if none)
-    rel_max_val = rel_mean_val = rel_count_hi_val = rel_n_val = np.nan
+    # News relevancy features — aggregate from articles passed by the pipeline
+    import news_scraper as _ns
     if news_articles:
-        scores = [float(a.get("relevance_score", 0.0)) for a in news_articles]
-        if scores:
-            rel_max_val      = float(max(scores))
-            rel_mean_val     = float(sum(scores) / len(scores))
-            rel_count_hi_val = float(sum(1 for s in scores if s >= 0.5))
-            rel_n_val        = float(len(scores))
+        nf = _ns.aggregate_relevancy_features(news_articles)
+    else:
+        nf = {"rel_max": 0.0, "rel_mean": 0.0, "rel_top3_mean": 0.0,
+              "rel_count_hi": 0, "rel_n": 0}
+
+    # Speaker activity features (look up from DB)
+    sp_act_map = _get_speaker_activity_map()
+    sp_dates   = sp_act_map.get(speaker, [])
+    import datetime as _dt
+    today_str = _dt.date.today().isoformat()
+    days_since_val, events_30d_val = _speaker_activity(sp_dates, today_str)
+    ds_val_inf = float("nan") if days_since_val == 999.0 else float(days_since_val)
+
+    # Interaction features
+    mv_hist = float(ko - hit_rate_lifetime) if not np.isnan(ko) else float("nan")
+    mv_word = float(ko - wg) if not np.isnan(ko) else float("nan")
 
     X = pd.DataFrame([{
-        "hit_rate_lifetime":           hit_rate_lifetime,
-        "hit_rate_recent":             hit_rate_recent,
-        "momentum":                    momentum,
-        "avg_freq":                    avg_freq,
-        "recency":                     recency,
-        "n_samples_lifetime":          n_samples_lifetime,
-        "kalshi_odds":                 ko,
-        "topic_match":                 tm_score_spacy,
-        "hit_rate_word_global":        wg,
-        "hit_rate_word_in_event_type": we,
-        "hit_rate_credibility":        cred,
-        "event_type_prior":            et_prior,
-        "rel_max":                     rel_max_val,
-        "rel_mean":                    rel_mean_val,
-        "rel_count_hi":                rel_count_hi_val,
-        "rel_n":                       rel_n_val,
+        "hit_rate_lifetime":              hit_rate_lifetime,
+        "hit_rate_recent":                hit_rate_recent,
+        "momentum":                       momentum,
+        "avg_freq":                       avg_freq,
+        "recency":                        recency,
+        "n_samples_lifetime":             n_samples_lifetime,
+        "kalshi_odds":                    ko,
+        "hit_rate_word_global":           wg,
+        "hit_rate_word_in_event_type":    we,
+        "hit_rate_speaker_event_type":    _lookup_speaker_et_prior(speaker, word, event_type, priors),
+        "hit_rate_credibility":           cred,
+        "event_type_prior":               et_prior,
+        "word_rank":                      float(_get_word_ranks().get((speaker, word), float("nan"))),
+        "market_vs_history":              mv_hist,
+        "market_vs_word_prior":           mv_word,
+        "days_since_last_event":          ds_val_inf,
+        "events_in_last_30d":             float(events_30d_val),
+        "topic_match":                    float(tm_score_gate),
+        "rel_max":                        float(nf["rel_max"]),
+        "rel_mean":                       float(nf["rel_mean"]),
+        "rel_top3_mean":                  float(nf["rel_top3_mean"]),
+        "rel_count_hi":                   float(nf["rel_count_hi"]),
+        "rel_n":                          float(nf["rel_n"]),
     }], columns=FEATURES).astype(float)
 
     ensemble  = _get_ensemble()
     lgbm_prob = float(np.mean([b.predict(X)[0] for b in ensemble]))
+
+    # Blend in LR ensemble member if available
+    lr_bundle = _load_lr_model()
+    if lr_bundle is not None:
+        try:
+            X_lr = X.copy()
+            for col, med in lr_bundle["col_medians"].items():
+                if col in X_lr.columns:
+                    X_lr[col] = X_lr[col].fillna(med)
+            X_lr_scaled = lr_bundle["scaler"].transform(X_lr.values)
+            lr_prob = float(lr_bundle["model"].predict_proba(X_lr_scaled)[0][1])
+            # Equal-weight blend: 10 LGBM + 1 LR
+            lgbm_prob = (lgbm_prob * 10 + lr_prob) / 11
+        except Exception:
+            pass  # silently fall back to LGBM-only if LR fails
 
     calibrator = _get_calibrator()
     if calibrator is not None:
@@ -1447,11 +1793,15 @@ def _count_real_rows() -> int:
 
 
 def retrain() -> lgb.Booster:
-    global _booster_cache, _calibrator_cache, _word_priors_cache
+    global _booster_cache, _calibrator_cache, _word_priors_cache, \
+           _ensemble_cache, _word_ranks_cache, _speaker_activity_cache
     booster = train(save=True, verbose=False)
-    _booster_cache     = booster
-    _calibrator_cache  = _load_calibrator()
-    _word_priors_cache = _load_word_priors()
+    _booster_cache           = booster
+    _calibrator_cache        = _load_calibrator()
+    _word_priors_cache       = _load_word_priors()
+    _ensemble_cache          = None   # force reload of full ensemble
+    _word_ranks_cache        = None   # force recompute after new data
+    _speaker_activity_cache  = None   # force recompute after new data
     return booster
 
 
@@ -1465,12 +1815,16 @@ def _cli_train() -> None:
 
 
 def _cli_eval() -> None:
-    booster = load_model()
-    if booster is None:
+    ensemble = load_ensemble()
+    if not ensemble:
         print("No model found. Run --train first.")
         return
     calibrator = _load_calibrator()
     df, priors = build_training_dataset(verbose=True)
+
+    n_before = len(df)
+    df = df[df["n_samples_lifetime"] >= 2].reset_index(drop=True)
+    print(f"  Warm-only filter  : {n_before} → {len(df)} rows")
 
     dated_mask = df["event_date"].str.len() > 0
     if dated_mask.sum() >= 20:
@@ -1494,16 +1848,20 @@ def _cli_eval() -> None:
         df_train["_word"].tolist(),
         df_train["_event_type"].tolist(),
         df_train["did_say_word"].tolist(),
+        speakers=df_train["_speaker"].tolist() if "_speaker" in df_train.columns else None,
     )
     X_test = _build_features_with_priors(df_test, test_priors)
     y_test = df_test["did_say_word"].astype(int)
 
-    test_probs_raw = booster.predict(X_test)
+    # Use full ensemble (same as live inference), not just seed-0
+    test_probs_raw = np.mean([b.predict(X_test) for b in ensemble], axis=0)
     test_probs_cal = (_apply_calibrator(calibrator, test_probs_raw)
                       if calibrator is not None else test_probs_raw)
-    _print_metrics(booster, X_test, y_test, calibrator)
+    _print_metrics_from_probs(y_test.values, test_probs_cal,
+                              ensemble_size=len(ensemble))
     _print_calibration(y_test.values, test_probs_raw, test_probs_cal)
-    _print_importance(booster)
+    _print_importance(ensemble[0])
+    print(f"\n  Ensemble size     : {len(ensemble)}")
     print(f"\n  Optimal threshold : {_find_optimal_threshold(y_test.values, test_probs_cal):.3f}")
 
 
@@ -1560,6 +1918,7 @@ def _cli_calibrate() -> None:
         df_train["_word"].tolist(),
         df_train["_event_type"].tolist(),
         df_train["did_say_word"].tolist(),
+        speakers=df_train["_speaker"].tolist() if "_speaker" in df_train.columns else None,
     )
     X_test = _build_features_with_priors(df_test, test_priors)
     y_test = df_test["did_say_word"].astype(int)

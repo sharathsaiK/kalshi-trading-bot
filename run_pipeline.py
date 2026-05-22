@@ -35,7 +35,9 @@ from kalshi_word_counter import KalshiCounter, extract_speaker_turns
 # Constants
 # ---------------------------------------------------------------------------
 
-_DEFAULT_MIN_EDGE = 0.10   # minimum |EV| to log a trade recommendation
+_DEFAULT_MIN_EDGE     = 0.10   # minimum |EV| to log a trade recommendation
+_DEFAULT_YES_MIN_EDGE = 0.18   # higher bar for YES bets (model over-predicts YES)
+_DEFAULT_NO_MIN_EDGE  = 0.10   # lower bar for NO bets (more reliable)
 _MIN_TRANSCRIPT_CHARS = 5_000
 
 # ---- Real-time trading risk management ------------------------------------
@@ -127,6 +129,8 @@ def _generate_trade(
     market,                        # KalshiMarket object — provides full data
     mode: str,
     min_edge: float,
+    yes_min_edge: float = _DEFAULT_YES_MIN_EDGE,
+    no_min_edge: float  = _DEFAULT_NO_MIN_EDGE,
     bankroll: float = _DEFAULT_BANKROLL,
     kelly_fraction: float = _DEFAULT_KELLY_FRACTION,
     news_articles: Optional[list] = None,
@@ -163,10 +167,18 @@ def _generate_trade(
     ev_no  = (1.0 - our_prob) - no_ask
 
     # ---- Pick the better side and check edge --------------------------
-    if ev_yes >= min_edge and ev_yes >= ev_no:
-        bet_side, ev_per_contract = "yes", ev_yes
-        ask_price                 = yes_ask
-    elif ev_no >= min_edge:
+    if ev_yes >= yes_min_edge and ev_yes >= ev_no:
+        if speaker in kalshi_model._YES_BET_BLOCKED_SPEAKERS:
+            # Downgrade to NO if it has edge, else skip
+            if ev_no >= no_min_edge and yes_ask <= kalshi_model._MAX_NO_BET_ODDS:
+                bet_side, ev_per_contract = "no", ev_no
+                ask_price                 = no_ask
+            else:
+                return None, f"skip: YES bets blocked for {speaker}"
+        else:
+            bet_side, ev_per_contract = "yes", ev_yes
+            ask_price                 = yes_ask
+    elif ev_no >= no_min_edge:
         # Don't bet NO on high-conviction YES markets — model loses these reliably
         if yes_ask > kalshi_model._MAX_NO_BET_ODDS:
             return None, f"skip: NO bet blocked (yes_ask={yes_ask:.2f}>{kalshi_model._MAX_NO_BET_ODDS:.2f})"

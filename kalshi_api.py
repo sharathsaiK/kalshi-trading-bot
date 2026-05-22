@@ -176,7 +176,7 @@ def get_event_meta(event_ticker: str) -> dict:
 
 
 def get_pre_event_mid_price(market_ticker: str, event_date: str,
-                            window_days: int = 14) -> float:
+                            window_days: int = 7) -> float:
     """
     Return median pre-event YES mid-price from historical hourly candlesticks.
 
@@ -349,6 +349,7 @@ def find_speaker_events(
         "jefferson": ["KXJEFFERSONMENTION"],
         "rubio":     ["KXRUBIOMENTION"],
         "barr":      ["KXBARRMENTION"],
+        "hegseth":   ["KXHEGSETHMENTION"],
     }
 
     # Speculative ticker patterns to probe for *any* speaker. Kalshi follows
