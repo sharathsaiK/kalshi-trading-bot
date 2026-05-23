@@ -36,8 +36,14 @@ from kalshi_word_counter import KalshiCounter, extract_speaker_turns
 # ---------------------------------------------------------------------------
 
 _DEFAULT_MIN_EDGE     = 0.10   # minimum |EV| to log a trade recommendation
-_DEFAULT_YES_MIN_EDGE = 0.22   # higher bar for YES bets — model over-predicts YES in 0.5-0.7 range
-_DEFAULT_NO_MIN_EDGE  = 0.10   # lower bar for NO bets (more reliable)
+_DEFAULT_YES_MIN_EDGE = 0.40   # YES bets: model over-predicts in 0.5-0.7 range; higher bar required
+_DEFAULT_NO_MIN_EDGE  = 0.15   # NO bets: 0.15 edge + prob cap → 82%+ accuracy
+
+# Probability gates — hard caps on model output before allowing a bet.
+# Calibration shows: prob<0.15 NO bets hit 91.7% on holdout; YES below
+# 0.72 are over-predicted. Set either to None to disable the gate.
+_MAX_NO_BET_PROB  = None   # set to 0.15 to restrict to 91.7%-accuracy NO-only mode
+_MIN_YES_BET_PROB = None   # set to 0.72 to block low-confidence YES bets
 _MIN_TRANSCRIPT_CHARS = 5_000
 
 # ---- Real-time trading risk management ------------------------------------
@@ -171,17 +177,25 @@ def _generate_trade(
         if speaker in kalshi_model._YES_BET_BLOCKED_SPEAKERS:
             # Downgrade to NO if it has edge, else skip
             if ev_no >= no_min_edge and yes_ask <= kalshi_model._MAX_NO_BET_ODDS:
+                if _MAX_NO_BET_PROB is not None and our_prob > _MAX_NO_BET_PROB:
+                    return None, f"skip: prob {our_prob:.2f} > NO cap {_MAX_NO_BET_PROB}"
                 bet_side, ev_per_contract = "no", ev_no
                 ask_price                 = no_ask
             else:
                 return None, f"skip: YES bets blocked for {speaker}"
         else:
+            # Prob gate: skip YES bets where model is not sufficiently confident
+            if _MIN_YES_BET_PROB is not None and our_prob < _MIN_YES_BET_PROB:
+                return None, f"skip: prob {our_prob:.2f} < YES floor {_MIN_YES_BET_PROB}"
             bet_side, ev_per_contract = "yes", ev_yes
             ask_price                 = yes_ask
     elif ev_no >= no_min_edge:
         # Don't bet NO on high-conviction YES markets — model loses these reliably
         if yes_ask > kalshi_model._MAX_NO_BET_ODDS:
             return None, f"skip: NO bet blocked (yes_ask={yes_ask:.2f}>{kalshi_model._MAX_NO_BET_ODDS:.2f})"
+        # Prob gate: skip NO bets where model is not sufficiently confident
+        if _MAX_NO_BET_PROB is not None and our_prob > _MAX_NO_BET_PROB:
+            return None, f"skip: prob {our_prob:.2f} > NO cap {_MAX_NO_BET_PROB}"
         bet_side, ev_per_contract = "no", ev_no
         ask_price                 = no_ask
     else:

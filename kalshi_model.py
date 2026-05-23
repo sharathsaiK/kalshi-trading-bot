@@ -177,6 +177,7 @@ def _compute_word_priors() -> dict:
     total_yes = total_n = 0.0
 
     sw_freq: dict = defaultdict(list)
+    sw_outcomes: dict = defaultdict(list)
     sp_event_dates_set: dict = defaultdict(set)
     sp_n_total: dict = defaultdict(int)
 
@@ -193,6 +194,7 @@ def _compute_word_priors() -> dict:
         et_yes[etype]        += y;  et_n[etype]        += 1
         total_yes += y;  total_n += 1
         sw_freq[(sp, word)].append(af)
+        sw_outcomes[(sp, word)].append(y)
         sp_n_total[sp] += 1
         if edate:
             sp_event_dates_set[sp].add(edate)
@@ -242,6 +244,12 @@ def _compute_word_priors() -> dict:
     # LF-058: speaker_k — tiered K based on total obs count
     speaker_k: dict = {sp: _speaker_k(n) for sp, n in sp_n_total.items()}
 
+    # word_variance — Var(did_say_word) per (speaker, word); 0.25 = max uncertainty default
+    word_variance: dict[tuple, float] = {
+        k: float(np.var(ys)) if len(ys) >= 2 else 0.25
+        for k, ys in sw_outcomes.items()
+    }
+
     return {
         "word_global":         word_global,
         "word_etype":          word_etype,
@@ -250,6 +258,7 @@ def _compute_word_priors() -> dict:
         "word_freq_rank":      word_freq_rank,
         "speaker_event_dates": speaker_event_dates,
         "speaker_k":           speaker_k,
+        "word_variance":       word_variance,
     }
 
 
@@ -277,6 +286,7 @@ def _compute_word_priors_from_arrays(
     et_n:   dict = defaultdict(float)
     total_yes = total_n = 0.0
     sp_n_total: dict = defaultdict(int)
+    sw_outcomes_fold: dict = defaultdict(list)
 
     for i, (w, et, y) in enumerate(zip(words, event_types, labels)):
         w  = (w  or "")
@@ -288,6 +298,7 @@ def _compute_word_priors_from_arrays(
         et_yes[et]     += y;  et_n[et]     += 1
         total_yes += y;  total_n += 1
         sp_n_total[sp] += 1
+        sw_outcomes_fold[(sp, w)].append(y)
 
     global_prior = total_yes / total_n if total_n > 0 else 0.5
 
@@ -315,12 +326,18 @@ def _compute_word_priors_from_arrays(
 
     speaker_k: dict = {sp: _speaker_k(n) for sp, n in sp_n_total.items()}
 
+    word_variance_fold: dict = {
+        k: float(np.var(ys)) if len(ys) >= 2 else 0.25
+        for k, ys in sw_outcomes_fold.items()
+    }
+
     return {
         "word_global":      word_global,
         "word_etype":       word_etype,
         "global_prior":     global_prior,
         "event_type_prior": event_type_prior,
         "speaker_k":        speaker_k,
+        "word_variance":    word_variance_fold,
         # word_freq_rank and speaker_event_dates injected from global priors by caller
     }
 

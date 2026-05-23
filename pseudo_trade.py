@@ -24,10 +24,13 @@ import db
 import kalshi_model
 
 
-NO_MIN_EDGE  = 0.10   # matches run_pipeline._DEFAULT_NO_MIN_EDGE
-YES_MIN_EDGE = 0.22   # higher bar for YES bets — model over-predicts YES in 0.5-0.7 range
+NO_MIN_EDGE  = 0.15   # matches run_pipeline._DEFAULT_NO_MIN_EDGE
+YES_MIN_EDGE = 0.40   # YES bets: higher bar cuts over-predicted 0.5-0.7 range
 MIN_WARM     = 0          # allow cold rows for NO bets; YES still requires n>=3 (enforced inside _simulate)
 HOLDOUT_CUTOFF = kalshi_model.HOLDOUT_CUTOFF
+
+# Accuracy target for threshold sweep report
+_ACCURACY_TARGET = 0.90
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +120,147 @@ def _simulate(y: np.ndarray, probs: np.ndarray,
         "bet_accuracy":  n_correct / max(n_bets, 1),
         "mean_ev":       float(np.mean(evs)) if evs else 0.0,
     }
+
+
+def _simulate_thresholds(
+    y: np.ndarray, probs: np.ndarray,
+    ko: np.ndarray, warm: np.ndarray,
+    nsamp: Optional[np.ndarray],
+    yes_edge: float,
+    no_edge: float,
+    max_no_prob: Optional[float] = None,
+    min_yes_prob: Optional[float] = None,
+) -> dict:
+    """Same logic as _simulate() but with explicit edge thresholds + optional prob gates."""
+    max_no = kalshi_model._MAX_NO_BET_ODDS
+    total = 0.0
+    n_bets = n_correct = 0
+    for i in range(len(probs)):
+        if not (0.04 < ko[i] < 0.96):
+            continue
+        if not bool(warm[i]):
+            continue
+        p    = float(probs[i])
+        odds = float(ko[i])
+        yi   = int(y[i])
+        n_s  = int(nsamp[i]) if nsamp is not None else 99
+        ev_yes = p - odds
+        ev_no  = (1.0 - p) - (1.0 - odds)
+        if ev_yes >= yes_edge and ev_yes >= ev_no and n_s >= 3:
+            if min_yes_prob is not None and p < min_yes_prob:
+                continue
+            won = (yi == 1)
+        elif ev_no >= no_edge and odds <= max_no:
+            if max_no_prob is not None and p > max_no_prob:
+                continue
+            won = (yi == 0)
+        else:
+            continue
+        n_bets += 1
+        if won:
+            n_correct += 1
+    return {
+        "n_bets":       n_bets,
+        "bet_accuracy": n_correct / max(n_bets, 1),
+    }
+
+
+def _pnl_for_thresholds(
+    y: np.ndarray, probs: np.ndarray,
+    ko: np.ndarray, warm: np.ndarray, nsamp: Optional[np.ndarray],
+    yes_e: float, no_e: float,
+    max_no_prob: Optional[float] = None,
+    min_yes_prob: Optional[float] = None,
+) -> float:
+    """Flat $1/bet P&L in cents for given thresholds + prob gates."""
+    max_no = kalshi_model._MAX_NO_BET_ODDS
+    pnl = 0.0
+    for i in range(len(probs)):
+        if not (0.04 < ko[i] < 0.96) or not bool(warm[i]):
+            continue
+        p, odds, yi = float(probs[i]), float(ko[i]), int(y[i])
+        n_s = int(nsamp[i]) if nsamp is not None else 99
+        ev_yes = p - odds
+        ev_no  = (1.0 - p) - (1.0 - odds)
+        if ev_yes >= yes_e and ev_yes >= ev_no and n_s >= 3:
+            if min_yes_prob is not None and p < min_yes_prob:
+                continue
+            pnl += 100 * ((1 - odds) if yi == 1 else -odds)
+        elif ev_no >= no_e and odds <= max_no:
+            if max_no_prob is not None and p > max_no_prob:
+                continue
+            pnl += 100 * (odds if yi == 0 else -(1 - odds))
+    return pnl
+
+
+def _print_threshold_sweep(
+    y: np.ndarray, probs: np.ndarray,
+    ko: np.ndarray, warm: np.ndarray,
+    nsamp: Optional[np.ndarray],
+) -> None:
+    """
+    Part 1: Sweep YES/NO edge thresholds (no prob gates).
+    Part 2: Sweep the NO probability cap — the lever that actually reaches 90%.
+    Highlights the first operating point that reaches _ACCURACY_TARGET.
+    """
+    sep = "=" * 60
+
+    # ── Part 1: edge-only sweep ──────────────────────────────────────────────
+    print(f"\n{sep}")
+    print(f"THRESHOLD SWEEP — edge only  (target: {_ACCURACY_TARGET:.0%})")
+    print(sep)
+    print(f"  {'YES edge':>8} {'NO edge':>8} {'Bets':>6} {'Accuracy':>10}  {'P&L':>8}")
+    print(f"  {'-' * 48}")
+    target_hit_edge = False
+    for yes_e in [0.10, 0.20, 0.22, 0.30, 0.40, 0.45]:
+        for no_e in [0.05, 0.10, 0.15, 0.20, 0.25]:
+            r = _simulate_thresholds(y, probs, ko, warm, nsamp, yes_e, no_e)
+            if r["n_bets"] < 5:
+                continue
+            pnl = _pnl_for_thresholds(y, probs, ko, warm, nsamp, yes_e, no_e)
+            marker = ""
+            if r["bet_accuracy"] >= _ACCURACY_TARGET and not target_hit_edge:
+                marker = " ◄ TARGET"
+                target_hit_edge = True
+            print(f"  {yes_e:>8.2f} {no_e:>8.2f} {r['n_bets']:>6}  "
+                  f"{r['bet_accuracy']:>9.1%}  {pnl:>+7.0f}¢{marker}")
+
+    if not target_hit_edge:
+        print(f"\n  [!] {_ACCURACY_TARGET:.0%} not reachable via edge thresholds alone.")
+
+    # ── Part 2: NO probability cap sweep ────────────────────────────────────
+    print(f"\n{sep}")
+    print(f"PROB-CAP SWEEP — cap our_prob for NO bets  (YES gated ≥ 0.72)")
+    print(f"  Strategy: only bet NO when model is very confident (low prob)")
+    print(sep)
+    print(f"  {'max NO prob':>12} {'NO edge':>8} {'Bets':>6} {'Accuracy':>10}  {'P&L':>8}")
+    print(f"  {'-' * 52}")
+    target_hit_cap = False
+    for max_no_p in [0.30, 0.25, 0.22, 0.20, 0.18, 0.15]:
+        for no_e in [0.05, 0.10, 0.15]:
+            r = _simulate_thresholds(
+                y, probs, ko, warm, nsamp,
+                yes_edge=0.22, no_edge=no_e,
+                max_no_prob=max_no_p, min_yes_prob=0.72,
+            )
+            if r["n_bets"] < 5:
+                continue
+            pnl = _pnl_for_thresholds(
+                y, probs, ko, warm, nsamp,
+                yes_e=0.22, no_e=no_e,
+                max_no_prob=max_no_p, min_yes_prob=0.72,
+            )
+            marker = ""
+            if r["bet_accuracy"] >= _ACCURACY_TARGET and not target_hit_cap:
+                marker = " ◄ 90% TARGET"
+                target_hit_cap = True
+            print(f"  {max_no_p:>12.2f} {no_e:>8.2f} {r['n_bets']:>6}  "
+                  f"{r['bet_accuracy']:>9.1%}  {pnl:>+7.0f}¢{marker}")
+
+    if not target_hit_cap:
+        print(f"\n  [!] {_ACCURACY_TARGET:.0%} not reached even with prob cap.")
+        print(f"      Calibration improvement needed before 90% is achievable.")
+    print(f"\n{sep}\n")
 
 
 def _print_scorecard(
@@ -283,6 +427,9 @@ def run(retrain: bool = True) -> None:
         bettable       = bettable,
         warm_holdout   = warm_bettable,
     )
+
+    # ── 8. Threshold sweep — find the operating point for 90% accuracy ──────
+    _print_threshold_sweep(y, probs, ko, warm, nsamp=nsamp)
 
 
 if __name__ == "__main__":

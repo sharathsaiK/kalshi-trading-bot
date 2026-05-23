@@ -72,9 +72,27 @@ python3 harvest_training_data.py --holdout
 
 ## Current Holdout Performance (post-2026-03-01)
 
-| Metric | Value |
-|---|---|
-| AUC-ROC | 0.832 |
-| Bet accuracy | 81.2% |
-| ROI / bet | +29.8¢ |
-| Projected P&L @301 bets | +8,974¢ |
+Two betting modes are available — same model, different selectivity. Toggle by setting `_MAX_NO_BET_PROB` in `run_pipeline.py`.
+
+| Metric | Default Mode | High-Confidence Mode |
+|---|---|---|
+| YES edge threshold | ≥ 0.40 | ≥ 0.40 |
+| NO edge threshold | ≥ 0.15 | ≥ 0.15 |
+| Max NO prob cap | off | 0.15 |
+| **Bets placed** | **74** | **36** |
+| **Bet accuracy** | **82.4%** | **91.7%** |
+| **ROI / bet** | **+30.7¢** | **+26.5¢** |
+| **Total P&L** | **+2,275¢** | **+954¢** |
+| Projected P&L @301 bets | +9,254¢ | +8,009¢ |
+| AUC-ROC | 0.808 | 0.808 |
+| Brier score | 0.1774 | 0.1774 |
+
+> **Which mode to use?** Default mode makes more money (more bets, higher total P&L). High-confidence mode is better if you need to minimise individual bet risk.
+
+### Mode Comparison
+
+![Mode comparison chart](assets/mode_comparison.png)
+
+### Model Calibration
+
+![Calibration chart](assets/calibration.png)
