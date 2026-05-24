@@ -37,7 +37,7 @@ from kalshi_word_counter import KalshiCounter, extract_speaker_turns
 
 _DEFAULT_MIN_EDGE     = 0.10   # minimum |EV| to log a trade recommendation
 _DEFAULT_YES_MIN_EDGE = 0.40   # YES bets: model over-predicts in 0.5-0.7 range; higher bar required
-_DEFAULT_NO_MIN_EDGE  = 0.15   # NO bets: 0.15 edge + prob cap → 82%+ accuracy
+_DEFAULT_NO_MIN_EDGE  = 0.15   # NO bets: 0.15 edge → 82.4% accuracy sweet spot
 
 # Probability gates — hard caps on model output before allowing a bet.
 # Calibration shows: prob<0.15 NO bets hit 91.7% on holdout; YES below
