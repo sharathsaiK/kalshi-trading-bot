@@ -74,21 +74,22 @@ python3 harvest_training_data.py --holdout
 
 Three betting modes available — same model, different selectivity and sizing strategy.
 
-| Metric | Default Mode | High-Confidence Mode | Volume + Multiplier Mode |
-|---|---|---|---|
-| YES edge threshold | ≥ 0.40 | ≥ 0.40 | ≥ 0.22 |
-| NO edge threshold | ≥ 0.15 | ≥ 0.15 | ≥ 0.10 |
-| Max NO prob cap | off | 0.15 | off |
-| Contract sizing | flat Kelly | flat Kelly | Kelly × confidence (max 3×) |
-| **Bets placed** | **74** | **36** | **113** |
-| **Bet accuracy** | **82.4%** | **91.7%** | **76.1%** |
-| **ROI / bet** | **+30.7¢** | **+26.5¢** | **+23.0¢ flat / +25.0¢ scaled** |
-| **Total P&L** | **+2,275¢** | **+954¢** | **+2,598¢ flat / +5,815¢ scaled** |
-| Projected P&L @301 bets | +9,254¢ | +8,009¢ | +6,920¢ flat / **+15,500¢ scaled** |
-| AUC-ROC | 0.808 | 0.808 | 0.808 |
-| Brier score | 0.1774 | 0.1774 | 0.1774 |
+| Metric | Default Mode | High-Confidence Mode | Volume + Multiplier | **Active (83.1%)** |
+|---|---|---|---|---|
+| YES edge threshold | ≥ 0.40 | ≥ 0.40 | ≥ 0.22 | ≥ 0.22 |
+| NO edge threshold | ≥ 0.15 | ≥ 0.15 | ≥ 0.10 | ≥ 0.10 |
+| Min YES prob gate | off | off | off | **0.72** |
+| Max NO prob cap | off | 0.15 | off | **0.30** |
+| Contract sizing | flat Kelly | flat Kelly | Kelly × conf (3×) | Kelly × conf (3×) |
+| **Bets placed** | **74** | **36** | **113** | **77** |
+| **Bet accuracy** | **82.4%** | **91.7%** | **76.1%** | **83.1%** |
+| **ROI / bet** | **+30.7¢** | **+26.5¢** | **+25.0¢ scaled** | **+25.9¢ scaled** |
+| **Total P&L** | **+2,275¢** | **+954¢** | **+5,815¢ scaled** | **+4,501¢ scaled** |
+| Projected P&L @301 bets | +9,254¢ | +8,009¢ | +15,500¢ | **+17,596¢** |
+| AUC-ROC | 0.808 | 0.808 | 0.808 | 0.808 |
+| Brier score | 0.1774 | 0.1774 | 0.1774 | 0.1774 |
 
-> **Which mode to use?** Volume + Multiplier is the live trading mode — lower thresholds maximise bet volume, and the confidence multiplier (capped at 3×, bankroll-safe) sizes each bet proportionally to edge strength. Projected P&L at 301 bets is +15,500¢, nearly double Default Mode. High-Confidence mode is best if minimising individual bet risk is the priority.
+> **Active mode** gates YES bets at prob ≥ 0.72 (cuts the over-predicted 0.5–0.7 range) and NO bets at prob ≤ 0.30 (only high-confidence NO bets). Combined with the confidence multiplier (3× cap, bankroll-safe), this gives 83.1% accuracy and the highest projected P&L at +17,596¢ @301 bets.
 
 ### Mode Comparison
 

@@ -55,10 +55,16 @@ def _calibration_error(y_true: np.ndarray, probs: np.ndarray,
     return float(np.mean(errors)) if errors else 0.0
 
 
+
+# Active prob gates — must match run_pipeline._MIN_YES_BET_PROB / _MAX_NO_BET_PROB
+_MIN_YES_BET_PROB = 0.72   # block YES bets where model prob < 0.72
+_MAX_NO_BET_PROB  = 0.30   # block NO  bets where model prob > 0.30
+
+
 def _simulate(y: np.ndarray, probs: np.ndarray,
               ko: np.ndarray, warm: np.ndarray,
               nsamp: Optional[np.ndarray] = None) -> dict:
-    """Flat $1/bet P&L simulation — warm-gated, separate YES/NO thresholds."""
+    """Flat $1/bet P&L simulation — warm-gated, separate YES/NO thresholds + prob gates."""
     max_no = kalshi_model._MAX_NO_BET_ODDS
 
     total = yes_pnl = no_pnl = warm_pnl = cold_pnl = 0.0
@@ -85,10 +91,14 @@ def _simulate(y: np.ndarray, probs: np.ndarray,
         # YES bets require ≥3 events of history — n_samples=2 predictions are
         # dominated by hit_rate_lifetime which is too noisy for YES confidence
         if ev_yes >= YES_MIN_EDGE and ev_yes >= ev_no and n_s >= 3:
+            if p < _MIN_YES_BET_PROB:
+                continue
             side, entry = "YES", odds
             won = (yi == 1)
             evs.append(ev_yes)
         elif ev_no >= NO_MIN_EDGE and odds <= max_no:
+            if p > _MAX_NO_BET_PROB:
+                continue
             side, entry = "NO", (1.0 - odds)
             won = (yi == 0)
             evs.append(ev_no)
@@ -154,10 +164,14 @@ def _simulate_conf_scaled(
         ev_no  = (1.0 - p) - (1.0 - odds)
 
         if ev_yes >= YES_MIN_EDGE and ev_yes >= ev_no and n_s >= 3:
+            if p < _MIN_YES_BET_PROB:
+                continue
             mult = min(ev_yes / YES_MIN_EDGE, _CONF_MAX_MULT)
             entry = odds
             won   = (yi == 1)
         elif ev_no >= NO_MIN_EDGE and odds <= max_no:
+            if p > _MAX_NO_BET_PROB:
+                continue
             mult = min(ev_no / NO_MIN_EDGE, _CONF_MAX_MULT)
             entry = 1.0 - odds
             won   = (yi == 0)
