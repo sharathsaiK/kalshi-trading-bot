@@ -1,7 +1,3 @@
-*.db
-*.lgb
-*.pkl
-*.pyc
 __pycache__/
 venv/
 .DS_Store
@@ -13,3 +9,4 @@ pa6.c
 shelter
 find_leads.py
 adopt.txt
+schemas.db

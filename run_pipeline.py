@@ -36,13 +36,13 @@ from kalshi_word_counter import KalshiCounter, extract_speaker_turns
 # ---------------------------------------------------------------------------
 
 _DEFAULT_MIN_EDGE     = 0.10   # minimum |EV| to log a trade recommendation
-_DEFAULT_YES_MIN_EDGE = 0.22   # YES bets: lower threshold → more volume; multiplier handles sizing
-_DEFAULT_NO_MIN_EDGE  = 0.10   # NO bets: lower threshold → more volume; multiplier handles sizing
+_DEFAULT_YES_MIN_EDGE = 0.40   # YES bets: higher threshold → only strong edge bets (+26.2¢ ROI config)
+_DEFAULT_NO_MIN_EDGE  = 0.10   # NO bets: edge floor
 
 # Probability gates — hard caps on model output before allowing a bet.
 # Set either to None to disable the gate.
-_MAX_NO_BET_PROB  = 0.30   # skip NO bets where model prob > 0.30 (83.1% accuracy sweet spot)
-_MIN_YES_BET_PROB = 0.72   # skip YES bets where model prob < 0.72 (cuts over-predicted 0.5-0.7 range)
+_MAX_NO_BET_PROB  = None   # disabled — edge filter already screens out weak NO bets
+_MIN_YES_BET_PROB = None   # disabled — YES edge ≥ 0.40 is a strong enough filter
 _MIN_TRANSCRIPT_CHARS = 5_000
 
 # ---- Real-time trading risk management ------------------------------------

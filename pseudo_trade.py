@@ -381,10 +381,12 @@ def _print_scorecard(
     row("Warm row P&L",       f"{sim['warm_pnl']:+d}¢", "+2,036¢")
 
     if sim["n_bets"] and holdout_rows:
-        roi = sim["pnl"] / sim["n_bets"]
-        projected = roi * 301
-        print(f"\n  ROI per bet      : {roi:+.1f}¢")
-        print(f"  Projected @301   : {projected:+.0f}¢  (friend's bet count)")
+        roi_flat   = sim["pnl"] / sim["n_bets"]
+        roi_scaled = sim_scaled["pnl_scaled"] / sim_scaled["n_bets"] if sim_scaled["n_bets"] > 0 else 0
+        projected_scaled = roi_scaled * 301
+        print(f"\n  ROI per bet (flat)   : {roi_flat:+.1f}¢")
+        print(f"  ROI per bet (scaled) : {roi_scaled:+.1f}¢")
+        print(f"  Projected @301       : {projected_scaled:+.0f}¢  (scaled, matches real-money Kelly sizing)")
 
     # ── Confidence-scaled section ────────────────────────────────────────────
     print(f"\n  -- Confidence-scaled (max {_CONF_MAX_MULT}× multiplier) --")
