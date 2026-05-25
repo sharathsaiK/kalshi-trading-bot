@@ -72,22 +72,23 @@ python3 harvest_training_data.py --holdout
 
 ## Current Holdout Performance (post-2026-03-01)
 
-Two betting modes are available — same model, different selectivity. Toggle by setting `_MAX_NO_BET_PROB` in `run_pipeline.py`.
+Three betting modes available — same model, different selectivity and sizing strategy.
 
-| Metric | Default Mode | High-Confidence Mode |
-|---|---|---|
-| YES edge threshold | ≥ 0.40 | ≥ 0.40 |
-| NO edge threshold | ≥ 0.15 | ≥ 0.15 |
-| Max NO prob cap | off | 0.15 |
-| **Bets placed** | **74** | **36** |
-| **Bet accuracy** | **82.4%** | **91.7%** |
-| **ROI / bet** | **+30.7¢** | **+26.5¢** |
-| **Total P&L** | **+2,275¢** | **+954¢** |
-| Projected P&L @301 bets | +9,254¢ | +8,009¢ |
-| AUC-ROC | 0.808 | 0.808 |
-| Brier score | 0.1774 | 0.1774 |
+| Metric | Default Mode | High-Confidence Mode | Volume + Multiplier Mode |
+|---|---|---|---|
+| YES edge threshold | ≥ 0.40 | ≥ 0.40 | ≥ 0.22 |
+| NO edge threshold | ≥ 0.15 | ≥ 0.15 | ≥ 0.10 |
+| Max NO prob cap | off | 0.15 | off |
+| Contract sizing | flat Kelly | flat Kelly | Kelly × confidence (max 3×) |
+| **Bets placed** | **74** | **36** | **113** |
+| **Bet accuracy** | **82.4%** | **91.7%** | **76.1%** |
+| **ROI / bet** | **+30.7¢** | **+26.5¢** | **+23.0¢ flat / +25.0¢ scaled** |
+| **Total P&L** | **+2,275¢** | **+954¢** | **+2,598¢ flat / +5,815¢ scaled** |
+| Projected P&L @301 bets | +9,254¢ | +8,009¢ | +6,920¢ flat / **+15,500¢ scaled** |
+| AUC-ROC | 0.808 | 0.808 | 0.808 |
+| Brier score | 0.1774 | 0.1774 | 0.1774 |
 
-> **Which mode to use?** Default mode makes more money (more bets, higher total P&L). High-confidence mode is better if you need to minimise individual bet risk.
+> **Which mode to use?** Volume + Multiplier is the live trading mode — lower thresholds maximise bet volume, and the confidence multiplier (capped at 3×, bankroll-safe) sizes each bet proportionally to edge strength. Projected P&L at 301 bets is +15,500¢, nearly double Default Mode. High-Confidence mode is best if minimising individual bet risk is the priority.
 
 ### Mode Comparison
 

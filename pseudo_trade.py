@@ -24,10 +24,13 @@ import db
 import kalshi_model
 
 
-NO_MIN_EDGE  = 0.15   # matches run_pipeline._DEFAULT_NO_MIN_EDGE
-YES_MIN_EDGE = 0.40   # YES bets: higher bar cuts over-predicted 0.5-0.7 range
+NO_MIN_EDGE  = 0.10   # matches run_pipeline._DEFAULT_NO_MIN_EDGE
+YES_MIN_EDGE = 0.22   # matches run_pipeline._DEFAULT_YES_MIN_EDGE
 MIN_WARM     = 0          # allow cold rows for NO bets; YES still requires n>=3 (enforced inside _simulate)
 HOLDOUT_CUTOFF = kalshi_model.HOLDOUT_CUTOFF
+
+# Confidence multiplier cap — mirrors run_pipeline._CONF_MAX_MULT
+_CONF_MAX_MULT = 3
 
 # Accuracy target for threshold sweep report
 _ACCURACY_TARGET = 0.90
@@ -119,6 +122,63 @@ def _simulate(y: np.ndarray, probs: np.ndarray,
         "n_skipped_warm": n_skipped_warm,
         "bet_accuracy":  n_correct / max(n_bets, 1),
         "mean_ev":       float(np.mean(evs)) if evs else 0.0,
+    }
+
+
+def _simulate_conf_scaled(
+    y: np.ndarray, probs: np.ndarray,
+    ko: np.ndarray, warm: np.ndarray,
+    nsamp: Optional[np.ndarray] = None,
+) -> dict:
+    """
+    Confidence-scaled P&L: same gate logic as _simulate(), but each bet is
+    weighted by min(ev / threshold, _CONF_MAX_MULT).  Marginal bets (1× edge)
+    contribute 1 unit; strong bets contribute up to _CONF_MAX_MULT units.
+    Reports weighted P&L in cents and the effective average multiplier.
+    """
+    max_no = kalshi_model._MAX_NO_BET_ODDS
+    total_weighted = 0.0
+    total_units = 0.0
+    n_bets = n_correct = 0
+    multipliers = []
+
+    for i in range(len(probs)):
+        if not (0.04 < ko[i] < 0.96) or not bool(warm[i]):
+            continue
+        p    = float(probs[i])
+        odds = float(ko[i])
+        yi   = int(y[i])
+        n_s  = int(nsamp[i]) if nsamp is not None else 99
+
+        ev_yes = p - odds
+        ev_no  = (1.0 - p) - (1.0 - odds)
+
+        if ev_yes >= YES_MIN_EDGE and ev_yes >= ev_no and n_s >= 3:
+            mult = min(ev_yes / YES_MIN_EDGE, _CONF_MAX_MULT)
+            entry = odds
+            won   = (yi == 1)
+        elif ev_no >= NO_MIN_EDGE and odds <= max_no:
+            mult = min(ev_no / NO_MIN_EDGE, _CONF_MAX_MULT)
+            entry = 1.0 - odds
+            won   = (yi == 0)
+        else:
+            continue
+
+        pnl = (1.0 - entry) if won else -entry
+        total_weighted += pnl * mult
+        total_units    += mult
+        n_bets         += 1
+        multipliers.append(mult)
+        if won:
+            n_correct += 1
+
+    return {
+        "pnl_scaled":   round(total_weighted * 100),   # cents, weighted
+        "total_units":  round(total_units, 1),
+        "n_bets":       n_bets,
+        "n_correct":    n_correct,
+        "bet_accuracy": n_correct / max(n_bets, 1),
+        "avg_mult":     float(np.mean(multipliers)) if multipliers else 0.0,
     }
 
 
@@ -272,6 +332,7 @@ def _print_scorecard(
     auc: float,
     accuracy: float,
     sim: dict,
+    sim_scaled: dict,
     bettable: int,
     warm_holdout: int,
 ) -> None:
@@ -300,7 +361,7 @@ def _print_scorecard(
     row("Bets skipped (cold)",f"{sim['n_skipped_warm']}","20")
     row("Bet accuracy",       f"{sim['bet_accuracy']:.1%}", "49.5%")
     row("Mean EV per bet",    f"{sim['mean_ev']:.4f}",  "0.3012")
-    row("Simulated P&L",      f"{sim['pnl']:+d}¢",     "+2,036¢")
+    row("Simulated P&L (flat)",f"{sim['pnl']:+d}¢",    "+2,036¢")
     row("YES bet P&L",        f"{sim['yes_pnl']:+d}¢",  "+623¢")
     row("NO  bet P&L",        f"{sim['no_pnl']:+d}¢",   "+1,413¢")
     row("Warm row P&L",       f"{sim['warm_pnl']:+d}¢", "+2,036¢")
@@ -310,6 +371,19 @@ def _print_scorecard(
         projected = roi * 301
         print(f"\n  ROI per bet      : {roi:+.1f}¢")
         print(f"  Projected @301   : {projected:+.0f}¢  (friend's bet count)")
+
+    # ── Confidence-scaled section ────────────────────────────────────────────
+    print(f"\n  -- Confidence-scaled (max {_CONF_MAX_MULT}× multiplier) --")
+    print(f"  {'Metric':<30} {'Value':>10}")
+    print(f"  {'-'*42}")
+    print(f"  {'Bets placed':<30} {sim_scaled['n_bets']:>10}")
+    print(f"  {'Bet accuracy':<30} {sim_scaled['bet_accuracy']:>9.1%}")
+    print(f"  {'Avg multiplier':<30} {sim_scaled['avg_mult']:>10.2f}×")
+    print(f"  {'Total bet-units':<30} {sim_scaled['total_units']:>10.1f}")
+    print(f"  {'Scaled P&L':<30} {sim_scaled['pnl_scaled']:>+10}¢")
+    if sim_scaled["total_units"] > 0:
+        roi_scaled = sim_scaled["pnl_scaled"] / sim_scaled["total_units"]
+        print(f"  {'ROI / unit':<30} {roi_scaled:>+10.1f}¢")
 
     print(f"\n{sep}\n")
 
@@ -385,7 +459,8 @@ def run(retrain: bool = True) -> None:
     bettable     = int(((ko > 0.04) & (ko < 0.96)).sum())
     warm_bettable = int(((ko > 0.04) & (ko < 0.96) & warm).sum())
 
-    sim = _simulate(y, probs, ko, warm, nsamp=nsamp)
+    sim        = _simulate(y, probs, ko, warm, nsamp=nsamp)
+    sim_scaled = _simulate_conf_scaled(y, probs, ko, warm, nsamp=nsamp)
 
     # ── 5. Calibration buckets ───────────────────────────────────────────────
     print("\nCALIBRATION BUCKETS (holdout)")
@@ -424,6 +499,7 @@ def run(retrain: bool = True) -> None:
         auc            = auc,
         accuracy       = accuracy,
         sim            = sim,
+        sim_scaled     = sim_scaled,
         bettable       = bettable,
         warm_holdout   = warm_bettable,
     )

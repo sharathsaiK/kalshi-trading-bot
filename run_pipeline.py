@@ -36,12 +36,11 @@ from kalshi_word_counter import KalshiCounter, extract_speaker_turns
 # ---------------------------------------------------------------------------
 
 _DEFAULT_MIN_EDGE     = 0.10   # minimum |EV| to log a trade recommendation
-_DEFAULT_YES_MIN_EDGE = 0.40   # YES bets: model over-predicts in 0.5-0.7 range; higher bar required
-_DEFAULT_NO_MIN_EDGE  = 0.15   # NO bets: 0.15 edge → 82.4% accuracy sweet spot
+_DEFAULT_YES_MIN_EDGE = 0.22   # YES bets: lower threshold → more volume; multiplier handles sizing
+_DEFAULT_NO_MIN_EDGE  = 0.10   # NO bets: lower threshold → more volume; multiplier handles sizing
 
 # Probability gates — hard caps on model output before allowing a bet.
-# Calibration shows: prob<0.15 NO bets hit 91.7% on holdout; YES below
-# 0.72 are over-predicted. Set either to None to disable the gate.
+# Set either to None to disable the gate.
 _MAX_NO_BET_PROB  = None   # set to 0.15 to restrict to 91.7%-accuracy NO-only mode
 _MIN_YES_BET_PROB = None   # set to 0.72 to block low-confidence YES bets
 _MIN_TRANSCRIPT_CHARS = 5_000
@@ -54,6 +53,12 @@ _MAX_POSITION_PCT       = 0.10    # Never bet > 10% of bankroll on one market
 _MAX_SPREAD             = 0.10    # Skip markets where bid-ask > 10¢ (illiquid)
 _MIN_VOLUME             = 100.0   # Skip markets with < $100 volume
 _MIN_TIME_TO_CLOSE_SEC  = 30.0    # Skip markets closing in < 30 seconds
+
+# ---- Confidence-scaling multiplier ----------------------------------------
+# After Kelly produces a base contract count, scale it by how far EV exceeds
+# the threshold: 1× at threshold, 2× at 2× threshold, capped at _CONF_MAX_MULT.
+# Marginal bets (EV barely above threshold) stay small; strong bets scale up.
+_CONF_MAX_MULT = 3
 
 
 def _check_liquidity(market) -> tuple[bool, str]:
@@ -82,25 +87,39 @@ def _check_time_to_close(market) -> tuple[bool, str]:
     return True, ""
 
 
+def _confidence_multiplier(ev: float, threshold: float) -> float:
+    """
+    Contract size multiplier based on EV strength relative to its threshold.
+    At the threshold: 1×. At 2× the threshold: 2×. Capped at _CONF_MAX_MULT.
+    This replaces hard threshold-raising as the volume-vs-confidence dial:
+    keep the low threshold for maximum bet volume, but shrink marginal bets
+    and amplify strong ones automatically.
+    """
+    if threshold <= 0 or ev <= 0:
+        return 1.0
+    return min(ev / threshold, float(_CONF_MAX_MULT))
+
+
 def _kelly_contracts(
     prob: float,
     ask_price: float,
     bankroll: float,
     kelly_fraction: float = _DEFAULT_KELLY_FRACTION,
     max_position_pct: float = _MAX_POSITION_PCT,
+    conf_mult: float = 1.0,
 ) -> int:
     """
-    Compute number of contracts to buy using fractional Kelly criterion.
+    Compute number of contracts to buy using fractional Kelly criterion,
+    scaled by a confidence multiplier before the position cap is applied.
 
     Kelly formula for binary contract:
         f* = (p - ask) / (1 - ask)
     where p = our probability, ask = price to enter (0..1).
 
-    f* is the optimal fraction of bankroll to bet for log-utility growth.
-    We use a fraction of full Kelly (default 0.25x) for safety, and cap
-    each bet at max_position_pct of bankroll to limit drawdown.
-
-    Each contract costs ask_price; pays $1 if won, $0 if lost.
+    conf_mult scales the Kelly fraction proportionally to edge strength
+    (1× at threshold, up to _CONF_MAX_MULT× for the strongest bets).
+    The max_position_pct cap is enforced AFTER scaling so strong bets
+    can never exceed the bankroll limit.
     """
     if ask_price <= 0 or ask_price >= 1.0:
         return 0
@@ -109,7 +128,7 @@ def _kelly_contracts(
     if full_kelly <= 0:
         return 0
 
-    bet_fraction = min(full_kelly * kelly_fraction, max_position_pct)
+    bet_fraction = min(full_kelly * kelly_fraction * conf_mult, max_position_pct)
     bet_amount   = bankroll * bet_fraction
     contracts    = int(bet_amount / ask_price)
     return max(0, contracts)
@@ -211,13 +230,18 @@ def _generate_trade(
     if not ok:
         return None, f"skip: {reason}"
 
-    # ---- Kelly position sizing ----------------------------------------
-    side_prob = our_prob if bet_side == "yes" else (1.0 - our_prob)
-    contracts = _kelly_contracts(
+    # ---- Kelly position sizing with confidence multiplier -----------------
+    # Multiplier is applied inside Kelly so max_position_pct cap is enforced
+    # after scaling — a 3× strong bet can never exceed 10% of bankroll.
+    base_threshold = yes_min_edge if bet_side == "yes" else no_min_edge
+    conf_mult      = _confidence_multiplier(ev_per_contract, base_threshold)
+    side_prob      = our_prob if bet_side == "yes" else (1.0 - our_prob)
+    contracts      = _kelly_contracts(
         prob           = side_prob,
         ask_price      = ask_price,
         bankroll       = bankroll,
         kelly_fraction = kelly_fraction,
+        conf_mult      = conf_mult,
     )
     if contracts <= 0:
         return None, "kelly=0"
