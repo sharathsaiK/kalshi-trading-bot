@@ -1,100 +1,124 @@
-# Kalshi Prediction Market Bot
+# Kalshi Prediction Market Trading Bot
 
-LightGBM model that predicts whether a named speaker will say a target word during a live event, traded as YES/NO contracts on Kalshi.
+> Built at **[Qourex](https://github.com/jacobsfat)** — a quantitative trading startup building ML-driven systems for political prediction markets.
 
-**Tracked speakers:** Donald Trump, J.D. Vance, Jerome Powell, Marco Rubio, Michael Barr, Pete Hegseth
+An end-to-end machine learning pipeline that predicts whether political figures will say specific words during live speeches, then executes real-time bets on [Kalshi](https://kalshi.com) prediction markets using fractional Kelly criterion sizing.
+
+**Current holdout accuracy: 83.1% · AUC-ROC: 0.808 · Projected P&L: +$175.96 @ 301 bets**
 
 ---
 
-## Core Files
+## How It Works
 
-| File | Purpose |
+```
+Speech transcript
+      ↓
+Word counter (speaker-turn filtered)
+      ↓
+23-feature LightGBM ensemble
+  ├── Speaker hit-rate profiles
+  ├── News relevancy (Google News RSS)
+  └── Sentence-transformer topic similarity
+      ↓
+Kelly criterion position sizing
+  ├── Bid-ask spread gate  (≤ 10¢)
+  ├── Volume gate          (≥ $100)
+  └── Time-to-close gate   (≥ 30s)
+      ↓
+Trade logged to SQLite
+```
+
+---
+
+## Performance (Holdout — post 2026-03-01)
+
+| Metric | Active Mode |
 |---|---|
-| `run_pipeline.py` | Live trading orchestrator. Fetches open Kalshi markets, runs predictions, and logs bet recommendations. |
-| `kalshi_model.py` | LightGBM model: training, CV, 12-seed ensemble, Platt calibration, feature engineering, and `predict_proba()` for inference. |
-| `pseudo_trade.py` | Fixed-holdout evaluator (post-2026-03-01). Measures Brier, AUC, P&L, and ROI/bet against the holdout set. Run this after every model change. |
-| `backtest_trades.py` | Per-event backtest. Usage: `python3 backtest_trades.py <TICKER>` |
-| `db.py` | SQLite layer. Tables: `speaker_profiles`, `training_data`, `training_data_holdout`, `trade_log`. |
+| Bets placed | 77 |
+| **Bet accuracy** | **83.1%** |
+| ROI / bet | +25.9¢ scaled |
+| Total P&L | +$45.01 |
+| Projected P&L @ 301 bets | **+$175.96** |
+| AUC-ROC | 0.808 |
+| Brier score | 0.1774 |
 
-## Data Collection
+> Active mode gates YES bets at model probability ≥ 0.72 and NO bets at ≤ 0.30, combined with a 1–3x confidence multiplier on Kelly sizing. This cuts the over-predicted 0.5–0.7 probability range and maximizes risk-adjusted returns.
 
-| File | Purpose |
+### Mode Comparison
+![Mode comparison](assets/mode_comparison.png)
+
+### Calibration
+![Calibration curve](assets/calibration.png)
+
+---
+
+## Model — 23 Features
+
+| Category | Features |
 |---|---|
-| `harvest_training_data.py` | Scrapes settled Kalshi markets and populates `training_data`. Use `--holdout` flag for post-cutoff events. |
-| `kalshi_api.py` | Kalshi REST client — events, markets, candlestick prices. |
-| `news_scraper.py` | Fetches news relevancy scores for word/event pairs (Guardian, NYT, NewsAPI, FMP). |
-| `backfill_news.py` | Backfills news features for existing training or holdout rows. |
-| `backfill_topic_match.py` | Backfills `topic_match` transformer scores for existing rows. |
-| `kalshi_word_counter.py` | Counts word occurrences in event transcripts to determine `did_say_word`. |
-| `transcript_bot.py` | Fetches and parses event transcripts (YouTube captions, etc.). |
+| Speaker history | `hit_rate_lifetime`, `hit_rate_recent`, `momentum`, `recency`, `n_samples_lifetime`, `n_samples_recent` |
+| Word priors | `hit_rate_word_global`, `hit_rate_word_in_event_type`, `hit_rate_speaker_event_type`, `word_rank` |
+| Market signals | `kalshi_odds`, `market_vs_history`, `market_vs_word_prior`, `event_type_prior`, `hit_rate_credibility` |
+| News signals | `rel_max`, `rel_mean`, `rel_top3_mean`, `rel_count_hi`, `rel_n` |
+| Event context | `topic_match`, `days_since_last_event`, `events_in_last_30d` |
 
-## Model Utilities
+**Ensemble:** 11-seed LightGBM average + logistic regression blend, isotonic regression calibration.
 
-| File | Purpose |
+---
+
+## Stack
+
+| Layer | Tech |
 |---|---|
-| `topic_match.py` | Transformer-based semantic similarity between a word and event title (used as a feature). |
-| `queries.py` | Shared SQL queries used across multiple scripts. |
-| `connection.py` | Database connection helper. |
-| `maintenance.py` | DB cleanup and maintenance tasks. |
-| `rebuild_profiles_from_training.py` | Rebuilds `speaker_profiles` table from scratch using `training_data`. |
-| `restore_kalshi_odds.py` | Restores missing `kalshi_odds` values from API for existing training rows. |
-| `fix_training_prices.py` | Corrects malformed price entries in `training_data`. |
-| `profile_agent.py` | Builds and updates speaker-word profiles. |
+| Language | Python 3.12+ |
+| ML | LightGBM, scikit-learn |
+| NLP | sentence-transformers (`all-MiniLM-L6-v2`) |
+| Data | pandas, NumPy, SQLite |
+| APIs | Kalshi Trade API v2, Google News RSS, YouTube Data API |
+| Infra | Custom SQLite layer (`db.py`), daemon shell script for harvest scheduling |
 
-## Other
+---
 
-| File | Purpose |
-|---|---|
-| `backtest.py` | Older backtest script (superseded by `backtest_trades.py`). |
-| `lightgbm_test.py` | Sandbox for testing LightGBM behaviour in isolation. |
-| `kalshi_word_counter.py` | Word-frequency counter used to compute speaker vocab stats. |
+## Project Structure
+
+```
+kalshi/
+├── run_pipeline.py            # Main entry point — event mode or speaker mode
+├── kalshi_model.py            # LightGBM ensemble, training, CV, inference
+├── kalshi_api.py              # Kalshi REST API client + KalshiMarket dataclass
+├── db.py                      # SQLite schema and query layer
+├── profile_agent.py           # Speaker hit-rate profile builder
+├── news_scraper.py            # Google News aggregation + relevancy scoring
+├── topic_match.py             # Sentence-transformer event/word similarity
+├── transcript_bot.py          # Speech transcript scraper (White House, C-SPAN)
+├── kalshi_word_counter.py     # Target word counter with speaker-turn filtering
+├── backtest.py                # Historical backtesting pipeline
+├── pseudo_trade.py            # Fixed-holdout evaluator (Brier, AUC, P&L, ROI)
+└── harvest_training_data.py   # Scrapes settled markets into training_data table
+```
 
 ---
 
 ## Quick Start
 
 ```bash
-cd ~/Projects/kalshi
-source venv/bin/activate
+git clone https://github.com/jacobsfat/worm-files.git kalshi-bot
+cd kalshi-bot
+pip install -r requirements.txt
+cp .env.example .env   # add KALSHI_API_KEY, YOUTUBE_API_KEY
 
-# Train model and evaluate on holdout
-python3 pseudo_trade.py
+# Run against a specific Kalshi event
+python run_pipeline.py --event KXTRUMPSOTU-26FEB25
 
-# Evaluate only (no retrain)
-python3 pseudo_trade.py --no-train
+# Auto-discover all events for a speaker
+python run_pipeline.py --speaker "Donald Trump"
 
-# Run live pipeline for a specific event
-python3 run_pipeline.py --event KXTRUMPMENTION-26MAY28
-
-# Collect more holdout data
-python3 harvest_training_data.py --holdout
+# Evaluate model on holdout set
+python pseudo_trade.py
 ```
 
-## Current Holdout Performance (post-2026-03-01)
+---
 
-Three betting modes available — same model, different selectivity and sizing strategy.
+## Tracked Speakers
 
-| Metric | Default Mode | High-Confidence Mode | Volume + Multiplier | **Active (83.1%)** |
-|---|---|---|---|---|
-| YES edge threshold | ≥ 0.40 | ≥ 0.40 | ≥ 0.22 | ≥ 0.22 |
-| NO edge threshold | ≥ 0.15 | ≥ 0.15 | ≥ 0.10 | ≥ 0.10 |
-| Min YES prob gate | off | off | off | **0.72** |
-| Max NO prob cap | off | 0.15 | off | **0.30** |
-| Contract sizing | flat Kelly | flat Kelly | Kelly × conf (3×) | Kelly × conf (3×) |
-| **Bets placed** | **74** | **36** | **113** | **77** |
-| **Bet accuracy** | **82.4%** | **91.7%** | **76.1%** | **83.1%** |
-| **ROI / bet** | **+30.7¢** | **+26.5¢** | **+25.0¢ scaled** | **+25.9¢ scaled** |
-| **Total P&L** | **+2,275¢** | **+954¢** | **+5,815¢ scaled** | **+4,501¢ scaled** |
-| Projected P&L @301 bets | +9,254¢ | +8,009¢ | +15,500¢ | **+17,596¢** |
-| AUC-ROC | 0.808 | 0.808 | 0.808 | 0.808 |
-| Brier score | 0.1774 | 0.1774 | 0.1774 | 0.1774 |
-
-> **Active mode** gates YES bets at prob ≥ 0.72 (cuts the over-predicted 0.5–0.7 range) and NO bets at prob ≤ 0.30 (only high-confidence NO bets). Combined with the confidence multiplier (3× cap, bankroll-safe), this gives 83.1% accuracy and the highest projected P&L at +17,596¢ @301 bets.
-
-### Mode Comparison
-
-![Mode comparison chart](assets/mode_comparison.png)
-
-### Model Calibration
-
-![Calibration chart](assets/calibration.png)
+Donald Trump · J.D. Vance · Jerome Powell · Marco Rubio · Pete Hegseth · Michael Barr
