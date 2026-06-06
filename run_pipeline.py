@@ -24,10 +24,12 @@ from backtest import (
 )
 from kalshi_api import (
     find_speaker_events,
+    get_balance,
     get_event_markets,
     get_event_meta,
     get_event_time,
     guess_speaker,
+    place_order,
 )
 from kalshi_word_counter import KalshiCounter, extract_speaker_turns
 
@@ -36,13 +38,13 @@ from kalshi_word_counter import KalshiCounter, extract_speaker_turns
 # ---------------------------------------------------------------------------
 
 _DEFAULT_MIN_EDGE     = 0.10   # minimum |EV| to log a trade recommendation
-_DEFAULT_YES_MIN_EDGE = 0.40   # YES bets: higher threshold → only strong edge bets (+26.2¢ ROI config)
+_DEFAULT_YES_MIN_EDGE = 0.22   # YES bets: lower threshold → more volume; multiplier handles sizing
 _DEFAULT_NO_MIN_EDGE  = 0.10   # NO bets: edge floor
 
 # Probability gates — hard caps on model output before allowing a bet.
 # Set either to None to disable the gate.
-_MAX_NO_BET_PROB  = None   # disabled — edge filter already screens out weak NO bets
-_MIN_YES_BET_PROB = None   # disabled — YES edge ≥ 0.40 is a strong enough filter
+_MAX_NO_BET_PROB  = 0.30   # skip NO bets where model prob > 0.30 (high-accuracy config)
+_MIN_YES_BET_PROB = 0.72   # skip YES bets where model prob < 0.72 (cuts over-predicted 0.5-0.7 range)
 _MIN_TRANSCRIPT_CHARS = 5_000
 
 # ---- Real-time trading risk management ------------------------------------
@@ -160,6 +162,7 @@ def _generate_trade(
     kelly_fraction: float = _DEFAULT_KELLY_FRACTION,
     news_articles: Optional[list] = None,
     event_title: str = "",
+    demo: bool = False,
 ) -> tuple[Optional[int], str]:
     """
     Compare our LightGBM probability estimate to the Kalshi price and log a
@@ -258,6 +261,29 @@ def _generate_trade(
         event_type      = event_type,
         mode            = mode,
     )
+
+    # ---- Demo order execution -------------------------------------------
+    # Place a real market order on Kalshi's demo environment and store the
+    # returned order ID alongside the trade record.
+    if demo and mode == "demo":
+        try:
+            order_resp = place_order(
+                ticker = ticker,
+                side   = bet_side,
+                count  = contracts,
+                action = "buy",
+                demo   = True,
+            )
+            order_id = (order_resp.get("order") or {}).get("order_id", "")
+            if order_id:
+                db.update_trade_order_id(trade_id, order_id)
+            label = f"{bet_side.upper()} ×{contracts}"
+            print(f"  [DEMO ORDER] {label} → order_id={order_id or '(none returned)'}")
+            return trade_id, f"{label} [DEMO EXECUTED]"
+        except Exception as exc:
+            print(f"  [DEMO ORDER] Failed to place order for {ticker}: {exc}")
+            return trade_id, f"{bet_side.upper()} ×{contracts} [DEMO ORDER FAILED]"
+
     return trade_id, f"{bet_side.upper()} ×{contracts}"
 
 
@@ -275,10 +301,14 @@ def run_event(
     bankroll: float = _DEFAULT_BANKROLL,
     kelly_fraction: float = _DEFAULT_KELLY_FRACTION,
     fetch_news: bool = True,
+    demo: bool = False,
 ) -> Optional[float]:
     """
     Full pipeline for one Kalshi event:
       count → update profiles → news → trades
+
+    demo=True: after Kelly sizing, execute real market orders on Kalshi demo
+    environment. Requires KALSHI_DEMO_API_KEY in .env and mode="demo".
     """
     markets = get_event_markets(event_ticker)
     settled   = [m for m in markets if m.word and m.result in ("yes", "no")]
@@ -404,6 +434,7 @@ def run_event(
                 kelly_fraction = kelly_fraction,
                 news_articles  = arts,
                 event_title    = event_title,
+                demo           = demo,
             )
             ev_yes = our_prob - m.best_yes_price
             ev_no  = (1.0 - our_prob) - m.best_no_price
@@ -525,8 +556,19 @@ def run_event_mode(args) -> None:
     event_ticker   = args.event
     fallback_speaker = args.speaker or guess_speaker(event_ticker)
     event_date     = _parse_event_date(event_ticker)
-    mode           = "live" if args.live else "paper"
+    demo           = getattr(args, "demo", False)
+    mode           = "demo" if demo else ("live" if args.live else "paper")
     min_edge       = args.min_edge
+
+    # ── Demo: fetch live balance as bankroll (override --bankroll default) ──
+    bankroll = getattr(args, "bankroll", _DEFAULT_BANKROLL)
+    if demo:
+        live_balance = get_balance(demo=True)
+        if live_balance > 0:
+            bankroll = live_balance
+            print(f"Demo balance: ${bankroll:.2f}  (using as Kelly bankroll)")
+        else:
+            print(f"Demo balance: could not fetch — using default ${bankroll:.2f}")
 
     event_name = event_type = None
     try:
@@ -583,9 +625,10 @@ def run_event_mode(args) -> None:
         event_type      = event_type or "",
         mode            = mode,
         min_edge        = min_edge,
-        bankroll        = getattr(args, "bankroll", _DEFAULT_BANKROLL),
+        bankroll        = bankroll,
         kelly_fraction  = getattr(args, "kelly", _DEFAULT_KELLY_FRACTION),
         fetch_news      = not args.no_news,
+        demo            = demo,
     )
 
 
@@ -635,8 +678,19 @@ def _prefetch_transcript(
 
 def run_speaker_mode(args) -> None:
     speaker  = args.speaker
-    mode     = "live" if args.live else "paper"
+    demo     = getattr(args, "demo", False)
+    mode     = "demo" if demo else ("live" if args.live else "paper")
     min_edge = args.min_edge
+
+    # ── Demo: fetch live balance as bankroll ────────────────────────────────
+    bankroll = getattr(args, "bankroll", _DEFAULT_BANKROLL)
+    if demo:
+        live_balance = get_balance(demo=True)
+        if live_balance > 0:
+            bankroll = live_balance
+            print(f"Demo balance: ${bankroll:.2f}  (using as Kelly bankroll)")
+        else:
+            print(f"Demo balance: could not fetch — using default ${bankroll:.2f}")
 
     _TARGET_HITS   = 10   # stop after this many ≥90% accuracy events
     _MAX_FETCH     = 30   # fetch this many events from Kalshi to find _TARGET_HITS
@@ -737,9 +791,10 @@ def run_speaker_mode(args) -> None:
             event_type      = event_type or "",
             mode            = mode,
             min_edge        = min_edge,
-            bankroll        = getattr(args, "bankroll", _DEFAULT_BANKROLL),
+            bankroll        = bankroll,
             kelly_fraction  = getattr(args, "kelly", _DEFAULT_KELLY_FRACTION),
             fetch_news      = not args.no_news,
+            demo            = demo,
         )
 
         # Only count toward target if no settled markets (can't evaluate)
@@ -772,15 +827,25 @@ def main():
     p.add_argument("--file",     help="Transcript file path (skips fetching)")
     p.add_argument("--paste",    action="store_true", help="Paste transcript on stdin")
     p.add_argument("--live",     action="store_true", help="Log trades as live (default: paper)")
+    p.add_argument("--demo",     action="store_true",
+                   help="Execute orders on Kalshi demo environment "
+                        "(requires KALSHI_DEMO_API_KEY in .env). "
+                        "Fetches live demo balance as bankroll. "
+                        "Mutually exclusive with --live.")
     p.add_argument("--min-edge", type=float, default=_DEFAULT_MIN_EDGE,
                    dest="min_edge", help=f"Minimum |EV| to log a trade (default {_DEFAULT_MIN_EDGE})")
     p.add_argument("--bankroll", type=float, default=_DEFAULT_BANKROLL,
-                   help=f"Bankroll in dollars for Kelly sizing (default ${_DEFAULT_BANKROLL:.0f})")
+                   help=f"Bankroll in dollars for Kelly sizing (default ${_DEFAULT_BANKROLL:.0f}; "
+                        f"overridden by live demo balance when --demo is set)")
     p.add_argument("--kelly",    type=float, default=_DEFAULT_KELLY_FRACTION,
                    help=f"Kelly fraction (0=no bet, 1=full Kelly; default {_DEFAULT_KELLY_FRACTION})")
     p.add_argument("--no-news",  action="store_true", dest="no_news",
                    help="Skip news fetching step")
     args = p.parse_args()
+
+    if args.demo and args.live:
+        p.error("--demo and --live are mutually exclusive. "
+                "Use --demo for the Kalshi demo environment, --live for real-money trading.")
 
     if args.event:
         run_event_mode(args)

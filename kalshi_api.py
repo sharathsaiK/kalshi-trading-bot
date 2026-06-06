@@ -5,6 +5,7 @@ kalshi_api.py
 
 from __future__ import annotations
 
+import os
 import re
 import time
 import requests
@@ -18,7 +19,8 @@ try:
 except ImportError:
     _BS4 = False
 
-BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
+BASE_URL      = "https://api.elections.kalshi.com/trade-api/v2"
+DEMO_BASE_URL = "https://demo-api.kalshi.co/trade-api/v2"
 _LAST_HIT = 0.0
 _MIN_GAP = 0.4   # seconds between requests — keeps us under Kalshi's rate cap
 
@@ -113,6 +115,145 @@ def _get(path: str, params: dict | None = None,
     r = requests.get(f"{BASE_URL}{path}", params=params, timeout=20)
     r.raise_for_status()
     return r.json()
+
+
+# ---------------------------------------------------------------------------
+# Authenticated write client (demo + live)
+# ---------------------------------------------------------------------------
+
+def _auth_headers(demo: bool = True) -> dict:
+    """
+    Return Authorization + Content-Type headers for authenticated Kalshi requests.
+
+    Reads KALSHI_DEMO_API_KEY (demo=True) or KALSHI_API_KEY (demo=False) from
+    the environment / .env file. Raises RuntimeError if the key is absent so
+    callers get a clear error instead of a silent 401.
+    """
+    env_var = "KALSHI_DEMO_API_KEY" if demo else "KALSHI_API_KEY"
+    key = os.getenv(env_var, "").strip()
+    if not key:
+        env_name = "demo" if demo else "live"
+        raise RuntimeError(
+            f"Missing {env_var} environment variable. "
+            f"Add it to your .env file to use the {env_name} Kalshi API.\n"
+            f"  Get your key at: {'https://demo.kalshi.com' if demo else 'https://kalshi.com'} "
+            f"→ Account → API Access"
+        )
+    return {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+
+
+def _post(path: str, payload: dict, demo: bool = True) -> dict:
+    """
+    Authenticated POST to Kalshi API (demo by default) with rate-limiting.
+
+    Uses the same _MIN_GAP throttle as _get() to stay within Kalshi's rate cap.
+    Raises requests.HTTPError on non-2xx responses.
+    """
+    global _LAST_HIT
+    gap = time.time() - _LAST_HIT
+    if gap < _MIN_GAP:
+        time.sleep(_MIN_GAP - gap)
+    _LAST_HIT = time.time()
+
+    base = DEMO_BASE_URL if demo else BASE_URL
+    r = requests.post(
+        f"{base}{path}",
+        json=payload,
+        headers=_auth_headers(demo=demo),
+        timeout=20,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def get_balance(demo: bool = True) -> float:
+    """
+    Fetch the current account balance from Kalshi in dollars.
+
+    Kalshi reports balances in cents; this converts to dollars automatically.
+    Returns 0.0 on any error (prints a warning) so the caller can still run
+    with the default bankroll.
+
+    demo=True  → uses DEMO_BASE_URL + KALSHI_DEMO_API_KEY
+    demo=False → uses BASE_URL + KALSHI_API_KEY
+    """
+    global _LAST_HIT
+    try:
+        gap = time.time() - _LAST_HIT
+        if gap < _MIN_GAP:
+            time.sleep(_MIN_GAP - gap)
+        _LAST_HIT = time.time()
+
+        base = DEMO_BASE_URL if demo else BASE_URL
+        r = requests.get(
+            f"{base}/portfolio/balance",
+            headers=_auth_headers(demo=demo),
+            timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json()
+        cents = data.get("balance", 0)
+        return float(cents) / 100.0
+    except RuntimeError as exc:
+        print(f"  [balance] {exc}")
+        return 0.0
+    except Exception as exc:
+        env_label = "demo" if demo else "live"
+        print(f"  [balance] Could not fetch {env_label} balance: {exc}")
+        return 0.0
+
+
+def place_order(
+    ticker: str,
+    side: str,
+    count: int,
+    action: str = "buy",
+    demo: bool = True,
+) -> dict:
+    """
+    Place a market order on Kalshi (demo by default).
+
+    Parameters
+    ----------
+    ticker : str
+        The *market* ticker (e.g. "KXTRUMPSOTU-26FEB25-MEME"), NOT the event
+        ticker. These are the `ticker` fields on KalshiMarket objects.
+    side : str
+        "yes" or "no"
+    count : int
+        Number of contracts to buy/sell.
+    action : str
+        "buy" (default) or "sell"
+    demo : bool
+        True → Kalshi demo environment (no real money).
+        False → live production (real money — use with caution).
+
+    Returns the full Kalshi API response dict, which contains:
+        {"order": {"order_id": "...", "status": "...", ...}}
+
+    Raises requests.HTTPError on rejection (e.g. insufficient funds, bad ticker).
+    """
+    if count <= 0:
+        raise ValueError(f"place_order: count must be ≥ 1, got {count}")
+    if side not in ("yes", "no"):
+        raise ValueError(f"place_order: side must be 'yes' or 'no', got {side!r}")
+    if action not in ("buy", "sell"):
+        raise ValueError(f"place_order: action must be 'buy' or 'sell', got {action!r}")
+
+    return _post(
+        "/portfolio/orders",
+        {
+            "ticker": ticker,
+            "action": action,
+            "side":   side,
+            "count":  count,
+            "type":   "market",
+        },
+        demo=demo,
+    )
 
 
 def get_event_markets(event_ticker: str, historical: bool | None = None) -> list[KalshiMarket]:

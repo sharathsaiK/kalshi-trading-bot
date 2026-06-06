@@ -265,9 +265,85 @@ def _migrate_training_data() -> None:
                 conn.execute(f"ALTER TABLE training_data ADD COLUMN {col_name} {col_def}")
 
 
+def _migrate_trade_log() -> None:
+    """
+    Idempotent migration for trade_log:
+      1. Adds 'demo' to the mode CHECK constraint (requires table rebuild in SQLite).
+      2. Adds kalshi_order_id TEXT column for storing Kalshi's returned order ID.
+
+    Strategy: probe whether mode='demo' is accepted via a rolled-back test INSERT.
+    If it fails (old constraint), rebuild the table with the updated schema.
+    Either way, ensure kalshi_order_id column exists.
+    """
+    _NEW_TRADE_LOG_DDL = """
+CREATE TABLE trade_log (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    mode             TEXT NOT NULL DEFAULT 'paper'
+                          CHECK(mode IN ('paper', 'live', 'demo')),
+    ticker           TEXT NOT NULL,
+    speaker          TEXT NOT NULL,
+    event_type       TEXT NOT NULL DEFAULT '',
+    word             TEXT NOT NULL,
+    our_probability  REAL NOT NULL,
+    kalshi_odds      REAL NOT NULL,
+    ev_per_contract  REAL NOT NULL,
+    bet_side         TEXT NOT NULL CHECK(bet_side IN ('yes', 'no')),
+    contracts        INTEGER NOT NULL DEFAULT 0,
+    kalshi_order_id  TEXT DEFAULT NULL,
+    outcome          TEXT    DEFAULT NULL
+                          CHECK(outcome IN ('win', 'loss', 'cancelled', NULL)),
+    payout_cents     REAL    DEFAULT 0.0,
+    placed_at        TEXT    NOT NULL,
+    resolved_at      TEXT    DEFAULT NULL
+)
+"""
+    with _connect() as conn:
+        # ── Step 1: check if mode='demo' is already allowed ─────────────────
+        needs_rebuild = False
+        try:
+            conn.execute(
+                "INSERT INTO trade_log (mode, ticker, speaker, word, "
+                "our_probability, kalshi_odds, ev_per_contract, bet_side, placed_at) "
+                "VALUES ('demo','_probe','_probe','_probe',0,0,0,'yes','_probe')"
+            )
+            conn.execute("DELETE FROM trade_log WHERE ticker='_probe'")
+        except sqlite3.IntegrityError:
+            needs_rebuild = True
+            conn.rollback()
+
+        if needs_rebuild:
+            # Rebuild table with updated CHECK constraint
+            conn.execute("ALTER TABLE trade_log RENAME TO trade_log_bak")
+            conn.executescript(_NEW_TRADE_LOG_DDL)
+            # Copy existing rows (NULL for the new kalshi_order_id column)
+            conn.execute(
+                "INSERT INTO trade_log "
+                "(id, mode, ticker, speaker, event_type, word, "
+                " our_probability, kalshi_odds, ev_per_contract, "
+                " bet_side, contracts, kalshi_order_id, "
+                " outcome, payout_cents, placed_at, resolved_at) "
+                "SELECT id, mode, ticker, speaker, event_type, word, "
+                "       our_probability, kalshi_odds, ev_per_contract, "
+                "       bet_side, contracts, NULL, "
+                "       outcome, payout_cents, placed_at, resolved_at "
+                "FROM trade_log_bak"
+            )
+            conn.execute("DROP TABLE trade_log_bak")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tl_ticker ON trade_log (ticker)"
+            )
+            return   # column already included in new DDL
+
+        # ── Step 2: add kalshi_order_id if missing (no rebuild needed) ──────
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(trade_log)").fetchall()}
+        if "kalshi_order_id" not in existing:
+            conn.execute("ALTER TABLE trade_log ADD COLUMN kalshi_order_id TEXT DEFAULT NULL")
+
+
 _init_db()
 _migrate_news_cache()
 _migrate_training_data()
+_migrate_trade_log()
 
 
 # ---------------------------------------------------------------------------
@@ -523,31 +599,45 @@ def record_trade(
     contracts: int,
     event_type: str = "",
     mode: str = "paper",
+    kalshi_order_id: Optional[str] = None,
 ) -> int:
     """
-    Log a new trade (paper or live). Returns the new row id.
+    Log a new trade. Returns the new row id.
 
-    bet_side       — "yes" or "no"
+    bet_side        — "yes" or "no"
     our_probability — our model's P(YES) estimate
-    kalshi_odds    — current Kalshi price for bet_side (0-1)
+    kalshi_odds     — current Kalshi price for bet_side (0-1)
     ev_per_contract — expected value per contract in dollars
-    contracts      — number of contracts placed
-    mode           — "paper" (default) or "live"
+    contracts       — number of contracts placed
+    mode            — "paper" (default) | "live" | "demo"
+    kalshi_order_id — Kalshi-assigned order ID returned after execution (demo/live only)
     """
     sql = """
         INSERT INTO trade_log
             (mode, ticker, speaker, event_type, word,
              our_probability, kalshi_odds, ev_per_contract,
-             bet_side, contracts, placed_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             bet_side, contracts, kalshi_order_id, placed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     with _connect() as conn:
         cur = conn.execute(sql, (
             mode.lower(), ticker, speaker, event_type, word,
             float(our_probability), float(kalshi_odds), float(ev_per_contract),
-            bet_side.lower(), int(contracts), _now(),
+            bet_side.lower(), int(contracts), kalshi_order_id, _now(),
         ))
         return cur.lastrowid
+
+
+def update_trade_order_id(trade_id: int, kalshi_order_id: str) -> None:
+    """
+    Attach a Kalshi order ID to an already-recorded trade.
+
+    Called after a successful place_order() response so the DB row stays
+    linked to the live order even if the order ID wasn't available at INSERT time.
+    """
+    sql = "UPDATE trade_log SET kalshi_order_id = ? WHERE id = ?"
+    with _connect() as conn:
+        conn.execute(sql, (kalshi_order_id, trade_id))
 
 
 def record_outcome(
