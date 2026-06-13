@@ -10,3 +10,5 @@ shelter
 find_leads.py
 adopt.txt
 schemas.db
+dashboard/node_modules/
+dashboard/dist/
