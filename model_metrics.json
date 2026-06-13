@@ -1,0 +1,16 @@
+{
+  "accuracy": 74.5,
+  "auc": 0.827,
+  "brier": 0.1677,
+  "history": [
+    {
+      "version": "v1.4",
+      "date": "2026-05-28",
+      "auc": 0.827,
+      "brier": 0.1677,
+      "acc": 74.5,
+      "rows": 3110,
+      "active": true
+    }
+  ]
+}

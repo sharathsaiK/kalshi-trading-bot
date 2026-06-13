@@ -91,13 +91,13 @@ def _simulate(y: np.ndarray, probs: np.ndarray,
         # YES bets require ≥3 events of history — n_samples=2 predictions are
         # dominated by hit_rate_lifetime which is too noisy for YES confidence
         if ev_yes >= YES_MIN_EDGE and ev_yes >= ev_no and n_s >= 3:
-            if p < _MIN_YES_BET_PROB:
+            if _MIN_YES_BET_PROB is not None and p < _MIN_YES_BET_PROB:
                 continue
             side, entry = "YES", odds
             won = (yi == 1)
             evs.append(ev_yes)
         elif ev_no >= NO_MIN_EDGE and odds <= max_no:
-            if p > _MAX_NO_BET_PROB:
+            if _MAX_NO_BET_PROB is not None and p > _MAX_NO_BET_PROB:
                 continue
             side, entry = "NO", (1.0 - odds)
             won = (yi == 0)
@@ -164,13 +164,13 @@ def _simulate_conf_scaled(
         ev_no  = (1.0 - p) - (1.0 - odds)
 
         if ev_yes >= YES_MIN_EDGE and ev_yes >= ev_no and n_s >= 3:
-            if p < _MIN_YES_BET_PROB:
+            if _MIN_YES_BET_PROB is not None and p < _MIN_YES_BET_PROB:
                 continue
             mult = min(ev_yes / YES_MIN_EDGE, _CONF_MAX_MULT)
             entry = odds
             won   = (yi == 1)
         elif ev_no >= NO_MIN_EDGE and odds <= max_no:
-            if p > _MAX_NO_BET_PROB:
+            if _MAX_NO_BET_PROB is not None and p > _MAX_NO_BET_PROB:
                 continue
             mult = min(ev_no / NO_MIN_EDGE, _CONF_MAX_MULT)
             entry = 1.0 - odds

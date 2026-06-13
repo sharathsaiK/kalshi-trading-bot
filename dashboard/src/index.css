@@ -1,0 +1,218 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background-color: #070c18;
+  color: white;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Inter', sans-serif;
+  font-size: 14px;
+}
+
+/* ── Dot grid background ──────────────────────────────────────────────────── */
+.dot-grid {
+  background-color: #070c18;
+  background-image:
+    radial-gradient(circle, rgba(59, 130, 246, 0.12) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+/* Ambient corner glows */
+.dot-grid::before {
+  content: '';
+  pointer-events: none;
+  position: fixed;
+  inset: 0;
+  background:
+    radial-gradient(ellipse 60% 40% at 10% 0%,   rgba(59,130,246,0.07) 0%, transparent 60%),
+    radial-gradient(ellipse 40% 30% at 90% 100%,  rgba(16,185,129,0.06) 0%, transparent 60%),
+    radial-gradient(ellipse 50% 35% at 80% 5%,    rgba(139,92,246,0.04) 0%, transparent 50%);
+  z-index: 0;
+}
+
+/* ── Scrollbar ────────────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #1e2d45; border-radius: 4px; }
+
+/* ── Range sliders ────────────────────────────────────────────────────────── */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  border-radius: 2px;
+  background: #1f2937;
+  outline: none;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px; height: 14px;
+  border-radius: 50%;
+  background: #3b82f6;
+  cursor: pointer;
+  box-shadow: 0 0 8px rgba(59,130,246,0.6);
+}
+
+/* ── Glow text ────────────────────────────────────────────────────────────── */
+.glow-green { text-shadow: 0 0 18px rgba(16,185,129,0.6), 0 0 40px rgba(16,185,129,0.25); }
+.glow-blue  { text-shadow: 0 0 18px rgba(59,130,246,0.6), 0 0 40px rgba(59,130,246,0.25); }
+.glow-red   { text-shadow: 0 0 18px rgba(239,68,68,0.55); }
+.glow-white { text-shadow: 0 0 18px rgba(255,255,255,0.2); }
+
+/* ── Gradient text ────────────────────────────────────────────────────────── */
+.gradient-text-green {
+  background: linear-gradient(135deg, #34d399 0%, #06b6d4 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  filter: drop-shadow(0 0 12px rgba(52,211,153,0.35));
+}
+.gradient-text-blue {
+  background: linear-gradient(135deg, #60a5fa 0%, #a78bfa 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  filter: drop-shadow(0 0 12px rgba(96,165,250,0.35));
+}
+.gradient-text-gold {
+  background: linear-gradient(135deg, #fbbf24 0%, #f97316 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  filter: drop-shadow(0 0 10px rgba(251,191,36,0.3));
+}
+
+/* ── Gradient border card ─────────────────────────────────────────────────── */
+.card-glow {
+  position: relative;
+  background: linear-gradient(160deg, rgba(255,255,255,0.08) 0%, rgba(255,255,255,0.02) 100%);
+  border-radius: 14px;
+  padding: 1px;
+}
+.card-glow-inner {
+  background: linear-gradient(160deg, #111c2e 0%, #0d1525 100%);
+  border-radius: 13px;
+  height: 100%;
+}
+
+/* Hover shimmer */
+.card-glow::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 14px;
+  background: linear-gradient(135deg, rgba(255,255,255,0.04) 0%, transparent 50%);
+  opacity: 0;
+  transition: opacity 0.2s ease;
+  pointer-events: none;
+}
+.card-glow:hover::after { opacity: 1; }
+
+/* ── Active nav left accent bar ───────────────────────────────────────────── */
+.nav-active {
+  position: relative;
+}
+.nav-active::before {
+  content: '';
+  position: absolute;
+  left: -8px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 3px;
+  height: 60%;
+  border-radius: 0 2px 2px 0;
+  background: linear-gradient(180deg, #60a5fa, #34d399);
+  box-shadow: 0 0 8px rgba(96,165,250,0.6);
+}
+
+/* ── Banner pulse ─────────────────────────────────────────────────────────── */
+@keyframes borderPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(16,185,129,0.4), inset 0 0 0 1px rgba(16,185,129,0.3); }
+  50%       { box-shadow: 0 0 0 4px rgba(16,185,129,0), inset 0 0 0 1px rgba(16,185,129,0.6); }
+}
+.banner-pulse { animation: borderPulse 2.5s ease-in-out infinite; }
+
+/* ── Radar ping on Live Mode pill ─────────────────────────────────────────── */
+@keyframes radarPing {
+  0%   { transform: scale(1);   opacity: 0.7; }
+  70%  { transform: scale(2.2); opacity: 0; }
+  100% { transform: scale(2.2); opacity: 0; }
+}
+.radar-ping {
+  position: relative;
+  display: inline-block;
+}
+.radar-ping::before {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  border-radius: 50%;
+  background: rgba(52,211,153,0.5);
+  animation: radarPing 1.8s ease-out infinite;
+}
+
+/* ── Toast ────────────────────────────────────────────────────────────────── */
+@keyframes slideInRight  { from { transform: translateX(120%); opacity: 0; } to { transform: translateX(0);    opacity: 1; } }
+@keyframes slideOutRight { from { transform: translateX(0);    opacity: 1; } to { transform: translateX(120%); opacity: 0; } }
+.toast-in  { animation: slideInRight  0.35s cubic-bezier(0.16,1,0.3,1) forwards; }
+.toast-out { animation: slideOutRight 0.3s  ease-in forwards; }
+
+/* Action toast (approve / skip) */
+@keyframes slideInTop  { from { transform: translateY(-16px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+@keyframes slideOutTop { from { transform: translateY(0);     opacity: 1; } to { transform: translateY(-16px); opacity: 0; } }
+.action-toast-in  { animation: slideInTop  0.3s cubic-bezier(0.16,1,0.3,1) forwards; }
+.action-toast-out { animation: slideOutTop 0.25s ease-in forwards; }
+
+/* ── Count-up shimmer ─────────────────────────────────────────────────────── */
+@keyframes shimmer { 0% { opacity: 0.4; } 60% { opacity: 1; } 100% { opacity: 1; } }
+.count-shimmer { animation: shimmer 1.3s ease-out; }
+
+/* ── Page fade-in ─────────────────────────────────────────────────────────── */
+@keyframes pageFadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0);   }
+}
+.page-enter { animation: pageFadeIn 0.3s cubic-bezier(0.16,1,0.3,1) forwards; }
+
+/* ── Card hover lift ──────────────────────────────────────────────────────── */
+.card-hover { transition: transform 0.18s ease, box-shadow 0.18s ease; }
+.card-hover:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 12px 40px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.04);
+}
+
+/* ── Sticky table header with blur ───────────────────────────────────────── */
+.sticky-thead th {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  backdrop-filter: blur(12px);
+  background: rgba(14, 21, 33, 0.92);
+}
+
+/* ── Command palette backdrop ─────────────────────────────────────────────── */
+@keyframes backdropIn  { from { opacity: 0; } to { opacity: 1; } }
+@keyframes paletteIn   { from { opacity: 0; transform: scale(0.97) translateY(-8px); } to { opacity: 1; transform: scale(1) translateY(0); } }
+.palette-backdrop { animation: backdropIn  0.15s ease forwards; }
+.palette-panel    { animation: paletteIn   0.2s cubic-bezier(0.16,1,0.3,1) forwards; }
+
+/* ── Modal slide-in ───────────────────────────────────────────────────────── */
+@keyframes fadeSlideIn { from { opacity: 0; transform: scale(0.96) translateY(8px); } to { opacity: 1; transform: scale(1) translateY(0); } }
+
+/* ── Logo dot pulse ───────────────────────────────────────────────────────── */
+@keyframes logoDotGlow {
+  0%, 100% { filter: drop-shadow(0 0 2px #3b82f6); }
+  50%       { filter: drop-shadow(0 0 6px #60a5fa) drop-shadow(0 0 2px #93c5fd); }
+}
+.logo-dot-pulse { animation: logoDotGlow 2.5s ease-in-out infinite; }
+
+/* ── Arc gauge ────────────────────────────────────────────────────────────── */
+.arc-track { stroke: #1a2640; }
+.arc-fill  { transition: stroke-dashoffset 1.5s cubic-bezier(0.16,1,0.3,1); }
+
+/* ── Chart gradient enhancement ──────────────────────────────────────────── */
+.recharts-area-area { filter: saturate(1.2); }
+.recharts-line-curve { filter: drop-shadow(0 0 3px currentColor); }
