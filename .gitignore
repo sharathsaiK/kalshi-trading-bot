@@ -12,3 +12,6 @@ adopt.txt
 schemas.db
 dashboard/node_modules/
 dashboard/dist/
+dashboard/
+.vscode/
+KALSHI_API_FINDINGS_SIMPLE.md
