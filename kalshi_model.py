@@ -1670,7 +1670,8 @@ def predict_proba(
     kalshi_odds: float = 0.5,
     news_articles: Optional[list[dict]] = None,
     event_title: str = "",
-) -> float:
+    return_std: bool = False,
+) -> float | tuple[float, float]:
     """
     Return P(speaker says word in this event) in [0, 1].
 
@@ -1681,6 +1682,12 @@ def predict_proba(
       4. Apply isotonic calibration
       5. Apply context-aware veto gate for off-topic words
       6. Blend with hit_rate_lifetime when real data is scarce
+
+    If return_std=True, returns (prob, ensemble_std) where ensemble_std is
+    the std-dev of the raw per-seed ensemble predictions (before LR blend,
+    calibration, and veto gates) — a measure of how much the 10 LightGBM
+    seeds disagree. 0.0 for cold-start/blended-fallback paths where no
+    ensemble prediction was made.
     """
     profiles = db.get_cached_profile(speaker, word=word, event_type=event_type)
     if not profiles:
@@ -1710,7 +1717,7 @@ def predict_proba(
     # For cold-start words, return the event_type prior — we have no
     # reliable speaker signal and would never bet on these anyway.
     if n_samples_lifetime < 2:
-        return round(et_prior, 4)
+        return (round(et_prior, 4), 0.0) if return_std else round(et_prior, 4)
 
     ko = _mask_settlement_odds(kalshi_odds)
     if np.isnan(ko):
@@ -1764,8 +1771,10 @@ def predict_proba(
         "rel_n":                          float(nf["rel_n"]),
     }], columns=FEATURES).astype(float)
 
-    ensemble  = _get_ensemble()
-    lgbm_prob = float(np.mean([b.predict(X)[0] for b in ensemble]))
+    ensemble    = _get_ensemble()
+    seed_preds  = np.array([b.predict(X)[0] for b in ensemble])
+    lgbm_prob   = float(seed_preds.mean())
+    ensemble_std = float(seed_preds.std())
 
     # Blend in LR ensemble member if available
     lr_bundle = _load_lr_model()
@@ -1814,11 +1823,11 @@ def predict_proba(
 
     n_real = _count_real_rows()
     if n_real >= _MIN_REAL_ROWS:
-        return round(lgbm_prob, 4)
+        return (round(lgbm_prob, 4), ensemble_std) if return_std else round(lgbm_prob, 4)
 
     alpha   = n_real / _MIN_REAL_ROWS
     blended = alpha * lgbm_prob + (1 - alpha) * hit_rate_lifetime
-    return round(blended, 4)
+    return (round(blended, 4), ensemble_std) if return_std else round(blended, 4)
 
 
 def _count_real_rows() -> int:

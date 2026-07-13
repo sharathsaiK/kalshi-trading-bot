@@ -39,13 +39,33 @@ from kalshi_word_counter import KalshiCounter, extract_speaker_turns
 
 _DEFAULT_MIN_EDGE     = 0.10   # minimum |EV| to log a trade recommendation
 _DEFAULT_YES_MIN_EDGE = 0.22   # YES bets: lower threshold → more volume; multiplier handles sizing
-_DEFAULT_NO_MIN_EDGE  = 0.10   # NO bets: edge floor
+_DEFAULT_NO_MIN_EDGE  = 0.08   # NO bets: edge floor (lowered from 0.10 — holdout showed +15 profitable
+                               # bets / +$337 at 0.08, still well clear of breakeven)
 
 # Probability gates — hard caps on model output before allowing a bet.
 # Set either to None to disable the gate.
 _MAX_NO_BET_PROB  = 0.30   # skip NO bets where model prob > 0.30 (high-accuracy config)
 _MIN_YES_BET_PROB = 0.72   # skip YES bets where model prob < 0.72 (cuts over-predicted 0.5-0.7 range)
 _MIN_TRANSCRIPT_CHARS = 5_000
+
+# Ensemble-disagreement gates — std-dev across the 10 LightGBM seeds' raw
+# predictions. Thresholds derived from holdout: rows in the top ~20% of
+# disagreement (std > 0.038) hit 57.1% accuracy vs 66.3% for the rest —
+# high disagreement rows are meaningfully less trustworthy even when the
+# blended probability clears the edge threshold. Graduated instead of a
+# single cliff: size shrinks in two steps before the trade is skipped
+# outright, so borderline-disagreement rows still get some volume.
+_ENSEMBLE_STD_DOWNSIZE      = 0.032  # tier 1: halve position size above this
+_ENSEMBLE_STD_DOWNSIZE_MULT = 0.5
+_ENSEMBLE_STD_SEVERE        = 0.045  # tier 2: cut to 20% above this (was the hard skip line)
+_ENSEMBLE_STD_SEVERE_MULT   = 0.2
+_MAX_ENSEMBLE_STD           = 0.060  # tier 3: skip the trade entirely above this
+
+# NO bets where yes_ask is above kalshi_model._MAX_NO_BET_ODDS (0.70) used to
+# be blocked outright ("model loses these reliably"). Now allowed through at
+# a heavily reduced size instead — the price-extremity multiplier already
+# shrinks these, this cuts further since that gate existed for a reason.
+_NO_BET_ODDS_EXTREME_MULT = 0.3
 
 # ---- Real-time trading risk management ------------------------------------
 
@@ -61,6 +81,21 @@ _MIN_TIME_TO_CLOSE_SEC  = 30.0    # Skip markets closing in < 30 seconds
 # the threshold: 1× at threshold, 2× at 2× threshold, capped at _CONF_MAX_MULT.
 # Marginal bets (EV barely above threshold) stay small; strong bets scale up.
 _CONF_MAX_MULT = 3
+
+# ---- Price-extremity multiplier --------------------------------------------
+# A bet at 90¢ risks 9x more per contract than it can win, vs. even odds at
+# 90¢-50¢ split. The prob gates (_MIN_YES_BET_PROB / _MAX_NO_BET_PROB /
+# _MAX_NO_BET_ODDS) already block the worst of these outright, but bets that
+# clear the gates still get shrunk further the closer the price sits to 0¢
+# or 100¢, since a single bad call there costs far more than it can win.
+# 1.0x at 50¢, floors at _PRICE_EXTREMITY_FLOOR at 0¢/100¢, linear between.
+_PRICE_EXTREMITY_FLOOR = 0.5
+
+
+def _price_extremity_multiplier(ask_price: float) -> float:
+    """Shrinks position size as ask_price moves away from 50c toward 0c/100c."""
+    extremity = abs(ask_price - 0.5) * 2.0  # 0 at 50c, 1 at 0c or 100c
+    return 1.0 - extremity * (1.0 - _PRICE_EXTREMITY_FLOOR)
 
 
 def _check_liquidity(market) -> tuple[bool, str]:
@@ -182,19 +217,24 @@ def _generate_trade(
     yes_ask = market.best_yes_price
     no_ask  = market.best_no_price
 
-    our_prob = kalshi_model.predict_proba(
+    our_prob, ensemble_std = kalshi_model.predict_proba(
         speaker      = speaker,
         word         = word,
         event_type   = event_type,
         kalshi_odds  = yes_ask,
         news_articles = news_articles or [],
         event_title  = event_title,
+        return_std   = True,
     )
+
+    if ensemble_std > _MAX_ENSEMBLE_STD:
+        return None, f"skip: model disagreement too high (std={ensemble_std:.3f})"
 
     ev_yes = our_prob - yes_ask
     ev_no  = (1.0 - our_prob) - no_ask
 
     # ---- Pick the better side and check edge --------------------------
+    extreme_odds = False
     if ev_yes >= yes_min_edge and ev_yes >= ev_no:
         if speaker in kalshi_model._YES_BET_BLOCKED_SPEAKERS:
             # Downgrade to NO if it has edge, else skip
@@ -212,14 +252,15 @@ def _generate_trade(
             bet_side, ev_per_contract = "yes", ev_yes
             ask_price                 = yes_ask
     elif ev_no >= no_min_edge:
-        # Don't bet NO on high-conviction YES markets — model loses these reliably
-        if yes_ask > kalshi_model._MAX_NO_BET_ODDS:
-            return None, f"skip: NO bet blocked (yes_ask={yes_ask:.2f}>{kalshi_model._MAX_NO_BET_ODDS:.2f})"
         # Prob gate: skip NO bets where model is not sufficiently confident
         if _MAX_NO_BET_PROB is not None and our_prob > _MAX_NO_BET_PROB:
             return None, f"skip: prob {our_prob:.2f} > NO cap {_MAX_NO_BET_PROB}"
         bet_side, ev_per_contract = "no", ev_no
         ask_price                 = no_ask
+        # High-conviction YES markets (yes_ask > _MAX_NO_BET_ODDS) used to be
+        # blocked outright for NO bets — model loses these reliably. Now
+        # allowed through at heavily reduced size instead of a full block.
+        extreme_odds               = yes_ask > kalshi_model._MAX_NO_BET_ODDS
     else:
         return None, "no edge"
 
@@ -238,6 +279,13 @@ def _generate_trade(
     # after scaling — a 3× strong bet can never exceed 10% of bankroll.
     base_threshold = yes_min_edge if bet_side == "yes" else no_min_edge
     conf_mult      = _confidence_multiplier(ev_per_contract, base_threshold)
+    if ensemble_std > _ENSEMBLE_STD_SEVERE:
+        conf_mult *= _ENSEMBLE_STD_SEVERE_MULT
+    elif ensemble_std > _ENSEMBLE_STD_DOWNSIZE:
+        conf_mult *= _ENSEMBLE_STD_DOWNSIZE_MULT
+    conf_mult      *= _price_extremity_multiplier(ask_price)
+    if extreme_odds:
+        conf_mult *= _NO_BET_ODDS_EXTREME_MULT
     side_prob      = our_prob if bet_side == "yes" else (1.0 - our_prob)
     contracts      = _kelly_contracts(
         prob           = side_prob,
