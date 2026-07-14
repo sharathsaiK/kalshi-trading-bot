@@ -67,6 +67,16 @@ _MAX_ENSEMBLE_STD           = 0.060  # tier 3: skip the trade entirely above thi
 # shrinks these, this cuts further since that gate existed for a reason.
 _NO_BET_ODDS_EXTREME_MULT = 0.3
 
+# Event-type risk gate — foreign_diplomatic and rally events show real,
+# sample-size-credible overconfidence on Trump holdout data: 213-row
+# foreign_diplomatic sample has Brier 0.274 (worse than a coin-flip
+# baseline of 0.25) and only 57.7% accuracy vs 70.0%/0.206 for
+# domestic_political. Model overpredicts YES by ~16 points in both
+# foreign_diplomatic and rally. Downsize rather than block outright —
+# same reasoning as the other soft gates above.
+_RISKY_EVENT_TYPES        = {"foreign_diplomatic", "rally"}
+_RISKY_EVENT_TYPE_MULT    = 0.4
+
 # ---- Real-time trading risk management ------------------------------------
 
 _DEFAULT_BANKROLL       = 1000.0  # $1,000 default bankroll for sizing
@@ -286,6 +296,8 @@ def _generate_trade(
     conf_mult      *= _price_extremity_multiplier(ask_price)
     if extreme_odds:
         conf_mult *= _NO_BET_ODDS_EXTREME_MULT
+    if event_type in _RISKY_EVENT_TYPES:
+        conf_mult *= _RISKY_EVENT_TYPE_MULT
     side_prob      = our_prob if bet_side == "yes" else (1.0 - our_prob)
     contracts      = _kelly_contracts(
         prob           = side_prob,
