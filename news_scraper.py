@@ -339,11 +339,17 @@ def _fetch_bing_news(
     return articles
 
 
-def _gdelt_request(params: dict, retries: int = 3) -> Optional[dict]:
-    """GET GDELT with exponential backoff on 429."""
+_GDELT_TIMEOUT = 30   # GDELT responds slowly under load; 12s was timing out often
+_GDELT_RETRIES = 5    # more patience — was giving up too fast on 429 and timeouts
+
+
+def _gdelt_request(params: dict, retries: int = _GDELT_RETRIES) -> Optional[dict]:
+    """GET GDELT with exponential backoff on 429 AND on timeout (previously
+    timeouts gave up immediately with no retry — only 429s were retried)."""
     for attempt in range(retries):
         try:
-            resp = requests.get(_GDELT_URL, params=params, headers=_HEADERS, timeout=_TIMEOUT)
+            resp = requests.get(_GDELT_URL, params=params, headers=_HEADERS,
+                                 timeout=_GDELT_TIMEOUT)
             if resp.status_code == 429:
                 wait = 2 ** attempt
                 print(f"[news_scraper/gdelt] rate limited, retrying in {wait}s…")
@@ -351,6 +357,11 @@ def _gdelt_request(params: dict, retries: int = 3) -> Optional[dict]:
                 continue
             resp.raise_for_status()
             return resp.json()
+        except requests.Timeout:
+            wait = 2 ** attempt
+            print(f"[news_scraper/gdelt] timed out, retrying in {wait}s…")
+            time.sleep(wait)
+            continue
         except requests.RequestException as exc:
             print(f"[news_scraper/gdelt] {exc}")
             return None

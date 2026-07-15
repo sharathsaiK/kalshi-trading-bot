@@ -6,6 +6,7 @@ kalshi_model.py
 from __future__ import annotations
 
 import argparse
+import math
 import pickle
 from collections import defaultdict
 from pathlib import Path
@@ -26,7 +27,25 @@ from sklearn.metrics import (
 )
 
 import db
-import topic_match
+
+# topic_match lives at repo root in our layout; AI-Futures-Trader keeps its
+# copy alongside kalshi_model.py in pipeline/_5_probability/ — try both so
+# this module works dropped into either repo.
+try:
+    import topic_match
+except ImportError:
+    from pipeline._5_probability import topic_match  # type: ignore[no-redef]
+
+
+def _import_news_scraper():
+    """news_scraper is a top-level module in our layout, a `scrapers` package
+    in AI-Futures-Trader — try both so this module works in either repo."""
+    try:
+        import news_scraper as _ns
+        return _ns
+    except ImportError:
+        from scrapers import news_scraper as _ns
+        return _ns
 
 # ---------------------------------------------------------------------------
 # Config
@@ -36,6 +55,7 @@ MODEL_PATH       = Path(__file__).parent / "kalshi_model.lgb"
 CALIBRATOR_PATH  = Path(__file__).parent / "kalshi_calibrator.pkl"
 WORD_PRIORS_PATH = Path(__file__).parent / "kalshi_word_priors.pkl"
 LR_MODEL_PATH    = Path(__file__).parent / "kalshi_lr_model.pkl"
+WORD_EMB_CACHE_PATH = Path(__file__).parent / "word_embeddings_cache.pkl"
 
 # Holdout cutoff — events on or after this date NEVER enter training.
 HOLDOUT_CUTOFF = "2026-03-01"
@@ -81,6 +101,16 @@ FEATURES = [
     "rel_top3_mean",                 # news: mean of top-3 relevancy scores (94% NaN → learned NaN direction helps calibration)
     "rel_count_hi",                  # news: count of high-relevancy articles
     "rel_n",                         # news: total articles fetched for this word
+    # Tried and rejected (see git history / session notes): word_semantic_proximity,
+    # ko_velocity_24h/48h, news_decay_score, news_cooccur_rate, news_velocity,
+    # news_title_polarity, news_tone_mean. Retested news_* twice, including
+    # after improving GDELT retry patience (coverage only reached ~5-6%,
+    # still 0 gain both times) — genuine data-availability ceiling for these
+    # niche political mention markets, not a rate-limiting artifact. None
+    # improved holdout Brier/AUC/accuracy vs this 23-feature baseline.
+    # Feature-computation code stays available in the module (predict_proba's
+    # optional ticker/news_articles params, the backfill script, db columns)
+    # in case future data density makes them worth revisiting.
 ]
 
 EVENT_TYPE_ENC: dict[str, int] = {
@@ -419,6 +449,17 @@ def _build_features_with_priors(df_subset: pd.DataFrame, priors: dict) -> pd.Dat
             return vals
         return np.full(len(df_subset), np.nan)
 
+    def _raw_col(col: str) -> np.ndarray:
+        """Like _news_col but without the 0->NaN treatment — these columns
+        store real NULLs for missing data, and 0.0 is a legitimate value
+        (e.g. neutral polarity, zero velocity)."""
+        if col in df_subset.columns:
+            return df_subset[col].values.astype(float)
+        return np.full(len(df_subset), np.nan)
+
+    wsp_map  = _get_word_semantic_proximity_map()
+    wsp_vals = [float(wsp_map.get((sp, w), float("nan"))) for sp, w in zip(speakers, words)]
+
     return pd.DataFrame({
         "hit_rate_lifetime":             hl_arr,
         "hit_rate_recent":               df_subset["hit_rate_recent"].values.astype(float),
@@ -443,6 +484,14 @@ def _build_features_with_priors(df_subset: pd.DataFrame, priors: dict) -> pd.Dat
         "rel_top3_mean":                 _news_col("rel_top3_mean"),
         "rel_count_hi":                  _news_col("rel_count_hi"),
         "rel_n":                         _news_col("rel_n"),
+        "news_decay_score":              _raw_col("news_decay_score"),
+        "news_cooccur_rate":             _raw_col("news_cooccur_rate"),
+        "news_velocity":                 _raw_col("news_velocity"),
+        "news_title_polarity":           _raw_col("news_title_polarity"),
+        "news_tone_mean":                _raw_col("news_tone_mean"),
+        "word_semantic_proximity":       wsp_vals,
+        "ko_velocity_24h":               _raw_col("ko_velocity_24h"),
+        "ko_velocity_48h":               _raw_col("ko_velocity_48h"),
     }, columns=FEATURES).astype(float)
 
 
@@ -487,6 +536,7 @@ _word_priors_cache: Optional[dict] = None
 _speaker_activity_cache: Optional[dict] = None
 _n_events_speaker_cache: Optional[dict] = None
 _word_ranks_cache: Optional[dict] = None
+_word_semantic_proximity_cache: Optional[dict] = None
 
 
 def _get_speaker_activity_map() -> dict:
@@ -521,6 +571,132 @@ def _get_word_ranks() -> dict:
     if _word_ranks_cache is None:
         _word_ranks_cache = _compute_word_ranks()
     return _word_ranks_cache
+
+
+def _load_word_emb_cache() -> dict:
+    """Load incremental word-embedding cache from disk (word -> np.ndarray)."""
+    if WORD_EMB_CACHE_PATH.exists():
+        try:
+            with open(WORD_EMB_CACHE_PATH, "rb") as f:
+                return pickle.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_word_emb_cache(cache: dict) -> None:
+    """Persist incremental word-embedding cache to disk."""
+    try:
+        with open(WORD_EMB_CACHE_PATH, "wb") as f:
+            pickle.dump(cache, f)
+    except Exception:
+        pass
+
+
+def _compute_word_semantic_proximity(cutoff: str = HOLDOUT_CUTOFF) -> dict:
+    """
+    Cosine similarity between a target word and its speaker's centroid embedding.
+
+    For each speaker, embed their top-20 most-occurring words (by count across
+    events) and average those embeddings -> speaker_centroid. Then for every
+    (speaker, word) pair return cosine_sim(embed(word), speaker_centroid).
+
+    Embeddings are cached in word_embeddings_cache.pkl — only new words are
+    encoded on each call, since sentence-transformer encoding is slow relative
+    to a retrain.
+
+    Returns {} if sentence-transformers is unavailable (topic_match._get_st_model
+    returns None) — callers fall back to NaN.
+    """
+    model = topic_match._get_st_model()
+    if model is None:
+        return {}
+
+    with db._connect() as conn:
+        rows = conn.execute(
+            "SELECT speaker, word FROM training_data "
+            "WHERE event_date IS NULL OR event_date < ?",
+            (cutoff,),
+        ).fetchall()
+
+    from collections import Counter
+    sp_word_counts: dict = defaultdict(Counter)
+    sp_all_words:   dict = defaultdict(set)
+    for speaker, word in rows:
+        sp_word_counts[speaker][word] += 1
+        sp_all_words[speaker].add(word)
+
+    word_emb = _load_word_emb_cache()
+    all_words = list({w for words in sp_all_words.values() for w in words})
+    if not all_words:
+        return {}
+
+    new_words = [w for w in all_words if w not in word_emb]
+    if new_words:
+        new_embeddings = model.encode(new_words, convert_to_numpy=True,
+                                       batch_size=256, show_progress_bar=False)
+        for w, emb in zip(new_words, new_embeddings):
+            word_emb[w] = emb
+        _save_word_emb_cache(word_emb)
+
+    result: dict = {}
+    for speaker, wcount in sp_word_counts.items():
+        top20 = [w for w, _ in wcount.most_common(20)]
+        if not top20:
+            continue
+        centroid = np.mean([word_emb[w] for w in top20 if w in word_emb], axis=0)
+        c_norm   = np.linalg.norm(centroid)
+        if c_norm == 0:
+            continue
+        for word in sp_all_words[speaker]:
+            if word not in word_emb:
+                continue
+            w_emb  = word_emb[word]
+            w_norm = np.linalg.norm(w_emb)
+            if w_norm == 0:
+                result[(speaker, word)] = 0.0
+            else:
+                result[(speaker, word)] = float(np.dot(centroid, w_emb) / (c_norm * w_norm))
+    return result
+
+
+def _get_word_semantic_proximity_map() -> dict:
+    global _word_semantic_proximity_cache
+    if _word_semantic_proximity_cache is None:
+        _word_semantic_proximity_cache = _compute_word_semantic_proximity()
+    return _word_semantic_proximity_cache
+
+
+def _word_semantic_proximity(speaker: str, word: str) -> float:
+    """Lookup helper for predict_proba — NaN if not in the precomputed map."""
+    return float(_get_word_semantic_proximity_map().get((speaker, word), float("nan")))
+
+
+def _compute_ko_velocity(
+    ticker: str, current_odds: float, ref_ts: Optional[int] = None,
+) -> tuple[float, float]:
+    """
+    Price velocity: current_odds minus the YES price ~24h/48h earlier for the
+    same market. ref_ts defaults to now (live inference); pass an explicit
+    unix timestamp when backfilling historical rows. Returns (NaN, NaN) when
+    the ticker is unknown or no candle data is available in that window.
+    """
+    if not ticker or np.isnan(current_odds):
+        return float("nan"), float("nan")
+
+    import kalshi_api as _ka
+    if ref_ts is None:
+        ref_ts = int(datetime.datetime.now(tz=datetime.timezone.utc).timestamp())
+
+    try:
+        p24 = _ka.get_price_at_ts(ticker, ref_ts - 24 * 3600)
+        p48 = _ka.get_price_at_ts(ticker, ref_ts - 48 * 3600)
+    except Exception:
+        return float("nan"), float("nan")
+
+    v24 = float(current_odds - p24) if p24 is not None else float("nan")
+    v48 = float(current_odds - p48) if p48 is not None else float("nan")
+    return v24, v48
 
 
 def _load_word_priors() -> Optional[dict]:
@@ -728,6 +904,15 @@ def _rows_from_training_table(priors: dict, word_ranks: dict | None = None) -> l
             "rel_top3_mean": float(r.get("rel_top3_mean") or 0.0),
             "rel_count_hi":  float(r.get("rel_count_hi")  or 0),
             "rel_n":         float(r.get("rel_n")         or 0),
+            # Ported news/velocity features — real NULLs stay NaN (0 is a
+            # legitimate value for these, unlike the rel_* columns above)
+            "news_decay_score":    _to_nan(r.get("news_decay_score")),
+            "news_cooccur_rate":   _to_nan(r.get("news_cooccur_rate")),
+            "news_velocity":       _to_nan(r.get("news_velocity")),
+            "news_title_polarity": _to_nan(r.get("news_title_polarity")),
+            "news_tone_mean":      _to_nan(r.get("news_tone_mean")),
+            "ko_velocity_24h":     _to_nan(r.get("ko_velocity_24h")),
+            "ko_velocity_48h":     _to_nan(r.get("ko_velocity_48h")),
             # Labels / metadata
             "did_say_word": int(r["did_say_word"]),
             "event_date":   event_date,
@@ -804,6 +989,13 @@ def _rows_from_trade_log(priors: dict) -> list[dict]:
             "rel_top3_mean": 0.0,
             "rel_count_hi":  0.0,
             "rel_n":         0.0,
+            "news_decay_score":    float("nan"),
+            "news_cooccur_rate":   float("nan"),
+            "news_velocity":       float("nan"),
+            "news_title_polarity": float("nan"),
+            "news_tone_mean":      float("nan"),
+            "ko_velocity_24h":     float("nan"),
+            "ko_velocity_48h":     float("nan"),
             "did_say_word": did_say,
             "event_date":   "",
             "_weight":      5.0,
@@ -1663,6 +1855,173 @@ def _load_lr_model():
         return _pkl.load(f)
 
 
+# ---------------------------------------------------------------------------
+# News feature engineering — ported from AI-Futures-Trader
+# (decay score, cooccurrence, velocity, title polarity, VADER tone)
+# ---------------------------------------------------------------------------
+
+_DECAY_LAMBDA     = math.log(2) / 3.0  # 3-day half-life
+_NEWS_WINDOW_DAYS = 14
+
+_POL_POS: frozenset = frozenset({
+    "victory", "win", "wins", "won", "peace", "deal", "agreement",
+    "growth", "record", "strong", "success", "breakthrough", "historic",
+    "positive", "celebrate", "boom", "progress",
+})
+_POL_NEG: frozenset = frozenset({
+    "crisis", "war", "collapse", "fail", "failure", "attack", "bomb",
+    "disaster", "emergency", "scandal", "resign", "resigns", "threat",
+    "shock", "slump", "conflict",
+})
+
+
+def _get_vader():
+    try:
+        from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+        return SentimentIntensityAnalyzer()
+    except ImportError:
+        return None
+
+
+_VADER_SIA = _get_vader()
+
+_NEWS_DEFAULTS: dict = {
+    "news_has_any_news":   0,
+    "news_decay_score":    None,
+    "news_cooccur_rate":   None,
+    "news_velocity":       None,
+    "news_title_polarity": None,
+    "news_tone_mean":      None,
+}
+
+
+def _to_nan(v):
+    """None -> NaN, pass numbers through — for optional news feature values."""
+    return float("nan") if v is None else float(v)
+
+
+def _infer_art_age_days(pub, date_to, pos: int, n_total: int) -> int:
+    """
+    Estimate article age in days. GDELT seendate lags publication by 1-2 days,
+    so dates near the event can be negative. Falls back to position-based
+    estimate (position 0 = newest, position N-1 = oldest in DateDesc-sorted list).
+    """
+    if pub is not None:
+        raw = (date_to.date() - pub.date()).days
+        if 0 <= raw <= _NEWS_WINDOW_DAYS:
+            return raw
+    return int(pos / max(n_total - 1, 1) * _NEWS_WINDOW_DAYS)
+
+
+def _compute_raw_news_features(
+    articles: list[dict],
+    speaker: str,
+    word: str,
+    date_to: Optional[datetime.datetime] = None,
+) -> dict:
+    """
+    Compute decay/cooccurrence/velocity/polarity/tone news features from an
+    in-memory article list. Title-only matching for count/decay/velocity,
+    title+snippet for cooccurrence. All None when articles=[].
+    """
+    _ns = _import_news_scraper()
+
+    if not articles:
+        return dict(_NEWS_DEFAULTS)
+
+    if date_to is None:
+        date_to = datetime.datetime.now(tz=datetime.timezone.utc)
+
+    articles_clean = [
+        a for a in articles
+        if _ns.classify_article_type(a.get("title", ""), a.get("source", ""))
+        in ("news", "analysis")
+    ]
+    work = articles_clean if articles_clean else articles
+
+    parts   = speaker.strip().split()
+    surname = parts[-1].lower() if parts else speaker.lower()
+    word_l  = word.lower()
+
+    decay_score  = 0.0
+    n_title_word = 0
+    n_spkr = n_joint = 0
+    n_title_3d = n_title_11d = 0
+    n_total = len(work)
+
+    for i, art in enumerate(work):
+        title   = (art.get("title") or "").lower()
+        snippet = (art.get("snippet") or "").lower()
+        text    = title + (" " + snippet if snippet else "")
+        in_word      = word_l in title
+        in_word_text = word_l in text
+        in_spkr_text = surname in text
+
+        pub = art.get("published_at")
+        if isinstance(pub, str):
+            try:
+                pub = datetime.datetime.fromisoformat(pub)
+                if pub.tzinfo is None:
+                    pub = pub.replace(tzinfo=datetime.timezone.utc)
+            except ValueError:
+                pub = None
+
+        if in_word:
+            n_title_word += 1
+            age_days = _infer_art_age_days(pub, date_to, i, n_total)
+            decay_score += math.exp(-_DECAY_LAMBDA * age_days)
+            if age_days < 3:
+                n_title_3d += 1
+            elif age_days < 14:
+                n_title_11d += 1
+
+        if in_spkr_text:
+            n_spkr += 1
+            if in_word_text:
+                n_joint += 1
+
+    if n_title_word == 0:
+        decay_score = 0.0
+
+    cooccur_rate = (n_joint / n_spkr) if n_spkr > 0 else None
+
+    rate_recent = n_title_3d / 3
+    rate_older  = n_title_11d / 11
+    if rate_older < 0.01 and rate_recent < 0.01:
+        velocity = None
+    else:
+        velocity = max(-2.0, min(5.0, (rate_recent - rate_older) / max(rate_older, 0.1)))
+
+    pol_scores = []
+    for art in work:
+        t = (art.get("title") or "").lower()
+        if word_l not in t:
+            continue
+        twords = set(t.split())
+        pos = len(twords & _POL_POS)
+        neg = len(twords & _POL_NEG)
+        if pos + neg > 0:
+            pol_scores.append((pos - neg) / (pos + neg))
+    title_polarity = sum(pol_scores) / len(pol_scores) if pol_scores else None
+
+    tone_scores: list[float] = []
+    if _VADER_SIA is not None:
+        for art in work:
+            raw_title = art.get("title") or ""
+            if raw_title and word_l in raw_title.lower():
+                tone_scores.append(_VADER_SIA.polarity_scores(raw_title)["compound"])
+    tone_mean = sum(tone_scores) / len(tone_scores) if tone_scores else None
+
+    return {
+        "news_has_any_news":   1,
+        "news_decay_score":    decay_score,
+        "news_cooccur_rate":   cooccur_rate,
+        "news_velocity":       velocity,
+        "news_title_polarity": title_polarity,
+        "news_tone_mean":      tone_mean,
+    }
+
+
 def predict_proba(
     speaker: str,
     word: str,
@@ -1671,6 +2030,11 @@ def predict_proba(
     news_articles: Optional[list[dict]] = None,
     event_title: str = "",
     return_std: bool = False,
+    ticker: str = "",
+    event_ts: Optional[int] = None,
+    news_word_relative_rank: float = float("nan"),
+    ko_velocity_24h: float = float("nan"),
+    ko_velocity_48h: float = float("nan"),
 ) -> float | tuple[float, float]:
     """
     Return P(speaker says word in this event) in [0, 1].
@@ -1688,6 +2052,11 @@ def predict_proba(
     calibration, and veto gates) — a measure of how much the 10 LightGBM
     seeds disagree. 0.0 for cold-start/blended-fallback paths where no
     ensemble prediction was made.
+
+    news_word_relative_rank / ko_velocity_24h / ko_velocity_48h: accepted for
+    call-site compatibility with the AI-Futures-Trader pipeline (which passes
+    these as kwargs), but not used — none of them survived a fair holdout
+    test in this model (see FEATURES list comment) and aren't in FEATURES.
     """
     profiles = db.get_cached_profile(speaker, word=word, event_type=event_type)
     if not profiles:
@@ -1726,12 +2095,18 @@ def predict_proba(
     tm_score_gate = topic_match.compute_match_transformer(event_title, word)
 
     # News relevancy features — aggregate from articles passed by the pipeline
-    import news_scraper as _ns
+    _ns = _import_news_scraper()
     if news_articles:
         nf = _ns.aggregate_relevancy_features(news_articles)
     else:
         nf = {"rel_max": 0.0, "rel_mean": 0.0, "rel_top3_mean": 0.0,
               "rel_count_hi": 0, "rel_n": 0}
+
+    # Ported news features — decay score, cooccurrence, velocity, polarity, tone
+    news_raw = _compute_raw_news_features(news_articles or [], speaker, word)
+
+    # Price velocity — NaN unless a ticker is supplied (live inference / backfill)
+    ko_vel_24h, ko_vel_48h = _compute_ko_velocity(ticker, ko, ref_ts=event_ts)
 
     # Speaker activity features (look up from DB)
     sp_act_map = _get_speaker_activity_map()
@@ -1769,6 +2144,14 @@ def predict_proba(
         "rel_top3_mean":                  float(nf["rel_top3_mean"]),
         "rel_count_hi":                   float(nf["rel_count_hi"]),
         "rel_n":                          float(nf["rel_n"]),
+        "news_decay_score":               _to_nan(news_raw["news_decay_score"]),
+        "news_cooccur_rate":              _to_nan(news_raw["news_cooccur_rate"]),
+        "news_velocity":                  _to_nan(news_raw["news_velocity"]),
+        "news_title_polarity":            _to_nan(news_raw["news_title_polarity"]),
+        "news_tone_mean":                 _to_nan(news_raw["news_tone_mean"]),
+        "word_semantic_proximity":        _word_semantic_proximity(speaker, word),
+        "ko_velocity_24h":                ko_vel_24h,
+        "ko_velocity_48h":                ko_vel_48h,
     }], columns=FEATURES).astype(float)
 
     ensemble    = _get_ensemble()
@@ -1830,6 +2213,77 @@ def predict_proba(
     return (round(blended, 4), ensemble_std) if return_std else round(blended, 4)
 
 
+# ---------------------------------------------------------------------------
+# AI-Futures-Trader pipeline compatibility
+#
+# Their pipeline/run_event.py does:
+#   from pipeline._5_probability.kalshi_model import (
+#       predict_proba, predict_proba_full, compute_event_word_ranks, ensemble_size,
+#   )
+# and calls predict_proba/predict_proba_full with a news_word_relative_rank
+# kwarg (predict_proba already accepts and ignores it, above). These three
+# functions cover the rest of that import so this module is a drop-in
+# replacement for theirs — same trained model, their pipeline's gating/sizing
+# stays untouched. Their db.get_cached_profile has the same signature/schema
+# as ours, so no db changes are needed on their side.
+# ---------------------------------------------------------------------------
+
+def predict_proba_full(
+    speaker: str,
+    word: str,
+    event_type: str = "",
+    kalshi_odds: float = 0.5,
+    news_articles: Optional[list[dict]] = None,
+    event_title: str = "",
+    news_word_relative_rank: float = float("nan"),
+    ko_velocity_24h: float = float("nan"),
+    ko_velocity_48h: float = float("nan"),
+) -> tuple[float, float]:
+    """Same as predict_proba(..., return_std=True) under their expected name."""
+    return predict_proba(
+        speaker=speaker, word=word, event_type=event_type,
+        kalshi_odds=kalshi_odds, news_articles=news_articles,
+        event_title=event_title, return_std=True,
+        news_word_relative_rank=news_word_relative_rank,
+        ko_velocity_24h=ko_velocity_24h, ko_velocity_48h=ko_velocity_48h,
+    )
+
+
+def compute_event_word_ranks(
+    news_by_word: dict[str, list],
+    speaker: str,
+    event_type: str = "",
+) -> dict[str, float]:
+    """
+    Compute news_word_relative_rank for all words in an event, called once
+    before the per-word predict_proba loop (their pipeline's pattern).
+    Returns {word: percentile_rank}, 0=least newsworthy, 1=most newsworthy.
+    Not used by our own FEATURES list, but their run_event.py computes this
+    before calling predict_proba and passes it in — provided for compatibility.
+    """
+    scores: dict[str, float] = {}
+    for word, articles in news_by_word.items():
+        feats = _compute_raw_news_features(articles, speaker, word)
+        d = feats.get("news_decay_score")
+        if d is not None:
+            scores[word] = float(d)
+
+    if not scores:
+        return {}
+
+    sorted_vals = sorted(scores.values())
+    n = len(sorted_vals)
+    return {
+        word: (sorted_vals.index(score) / (n - 1) if n > 1 else 0.5)
+        for word, score in scores.items()
+    }
+
+
+def ensemble_size() -> int:
+    """Number of models loaded in the inference ensemble."""
+    return len(_get_ensemble())
+
+
 def _count_real_rows() -> int:
     with db._connect() as conn:
         n_td = conn.execute("SELECT COUNT(*) FROM training_data").fetchone()[0]
@@ -1841,7 +2295,8 @@ def _count_real_rows() -> int:
 
 def retrain() -> lgb.Booster:
     global _booster_cache, _calibrator_cache, _word_priors_cache, \
-           _ensemble_cache, _word_ranks_cache, _speaker_activity_cache
+           _ensemble_cache, _word_ranks_cache, _speaker_activity_cache, \
+           _word_semantic_proximity_cache
     booster = train(save=True, verbose=False)
     _booster_cache           = booster
     _calibrator_cache        = _load_calibrator()
@@ -1849,6 +2304,7 @@ def retrain() -> lgb.Booster:
     _ensemble_cache          = None   # force reload of full ensemble
     _word_ranks_cache        = None   # force recompute after new data
     _speaker_activity_cache  = None   # force recompute after new data
+    _word_semantic_proximity_cache = None  # force recompute after new data
     return booster
 
 

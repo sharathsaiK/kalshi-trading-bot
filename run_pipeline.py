@@ -235,6 +235,7 @@ def _generate_trade(
         news_articles = news_articles or [],
         event_title  = event_title,
         return_std   = True,
+        ticker       = ticker,
     )
 
     if ensemble_std > _MAX_ENSEMBLE_STD:

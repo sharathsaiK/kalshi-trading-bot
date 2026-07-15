@@ -423,6 +423,72 @@ def get_pre_event_mid_price(market_ticker: str, event_date: str,
         return 0.0
 
 
+def get_price_at_ts(market_ticker: str, target_ts: int,
+                     tolerance_hours: int = 3) -> Optional[float]:
+    """
+    Return the YES mid-price closest to target_ts (unix seconds), searching a
+    window of +/- tolerance_hours around it via hourly candlesticks. Tries
+    the historical endpoint first (finalized markets), falls back to the live
+    endpoint (~3 month window) same as get_pre_event_mid_price.
+
+    Returns None if no usable candle is found in the window — callers should
+    treat this as "unavailable" (NaN feature), not zero.
+    """
+    tol_s = tolerance_hours * 3600
+    start_ts = target_ts - tol_s
+    end_ts   = target_ts + tol_s
+
+    def _closest_price(candles: list[dict]) -> Optional[float]:
+        best_p, best_dist = None, None
+        for c in candles:
+            ts = int(c.get("end_period_ts") or 0)
+            dist = abs(ts - target_ts)
+            mean_p = (c.get("price") or {}).get("mean")
+            p = None
+            if mean_p is not None:
+                try:
+                    pv = float(mean_p)
+                    if 0.04 < pv < 0.96:
+                        p = pv
+                except (TypeError, ValueError):
+                    pass
+            if p is None:
+                ya = (c.get("yes_ask") or {}).get("close")
+                yb = (c.get("yes_bid") or {}).get("close")
+                if ya is not None and yb is not None:
+                    try:
+                        ya, yb = float(ya), float(yb)
+                        if 0.0 < yb < 1.0 and 0.0 < ya < 1.0 and (ya - yb) < 0.30:
+                            p = (ya + yb) / 2.0
+                    except (TypeError, ValueError):
+                        pass
+            if p is None:
+                continue
+            if best_dist is None or dist < best_dist:
+                best_p, best_dist = p, dist
+        return best_p
+
+    try:
+        url = f"{BASE_URL}/historical/markets/{market_ticker}/candlesticks"
+        r = requests.get(url, params={"start_ts": start_ts, "end_ts": end_ts,
+                                       "period_interval": 60}, timeout=15)
+        if r.status_code == 200:
+            price = _closest_price(r.json().get("candlesticks", []) or [])
+            if price is not None:
+                return price
+
+        url_live = f"{BASE_URL}/markets/{market_ticker}/candlesticks"
+        r2 = requests.get(url_live, params={"start_ts": start_ts, "end_ts": end_ts,
+                                             "period_interval": 60}, timeout=15)
+        if r2.status_code == 200:
+            price = _closest_price(r2.json().get("candlesticks", []) or [])
+            if price is not None:
+                return price
+    except Exception:
+        pass
+    return None
+
+
 def list_series(category: str = "Politics", limit: int = 200) -> list[dict]:
     """All series in a category."""
     return _get("/series", {"category": category, "limit": limit}).get("series", []) or []

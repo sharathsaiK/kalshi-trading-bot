@@ -340,10 +340,35 @@ CREATE TABLE trade_log (
             conn.execute("ALTER TABLE trade_log ADD COLUMN kalshi_order_id TEXT DEFAULT NULL")
 
 
+def _migrate_ported_signal_features() -> None:
+    """
+    Idempotent: add ported-feature columns (news decay/cooccur/velocity/
+    polarity/tone + price velocity) to training_data and training_data_holdout.
+    word_semantic_proximity needs no column — it's computed live from
+    existing (speaker, word) pairs already in training_data.
+    """
+    new_cols = [
+        ("news_decay_score",    "REAL DEFAULT NULL"),
+        ("news_cooccur_rate",   "REAL DEFAULT NULL"),
+        ("news_velocity",       "REAL DEFAULT NULL"),
+        ("news_title_polarity", "REAL DEFAULT NULL"),
+        ("news_tone_mean",      "REAL DEFAULT NULL"),
+        ("ko_velocity_24h",     "REAL DEFAULT NULL"),
+        ("ko_velocity_48h",     "REAL DEFAULT NULL"),
+    ]
+    with _connect() as conn:
+        for table in ("training_data", "training_data_holdout"):
+            existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            for col_name, col_def in new_cols:
+                if col_name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_def}")
+
+
 _init_db()
 _migrate_news_cache()
 _migrate_training_data()
 _migrate_trade_log()
+_migrate_ported_signal_features()
 
 
 # ---------------------------------------------------------------------------
